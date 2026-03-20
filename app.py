@@ -1,1017 +1,1152 @@
-// Глобальное состояние
-let isRunning = false;
-let activeJobs = [];
-let economicTickerInterval = null;
-let autorunInterval = null;
+"""
+TradeScreener Pro - Главный файл приложения
+Версия с бегущей строкой экономических данных (FOMC, FED, NONFARM)
+"""
 
-// Инициализация приложения
-document.addEventListener('DOMContentLoaded', function() {
-    setupEventListeners();
-    updateMarketStatus();
-    updateEconomicCalendar();
-    loadEconomicTicker();
-    loadMarketIndices();
-    loadAutorunStatus();
-    
-    // Автообновление
-    setInterval(updateMarketStatus, 60000);
-    setInterval(checkQueueStatus, 1000);
-    setInterval(loadMarketIndices, 30000);
-    setInterval(updateEconomicCalendar, 300000);
-    
-    // Обновление бегущей строки каждую минуту
-    setInterval(loadEconomicTicker, 60000);
-    
-    // Обновление статуса автозапуска каждые 10 секунд
-    setInterval(loadAutorunStatus, 10000);
-});
+from flask import Flask, render_template, jsonify, request
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta, timezone
+import threading
+import time
+import json
+import os
+import csv
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
-function setupEventListeners() {
-    // Навигация по страницам
-    document.querySelectorAll('.nav-item').forEach(item => {
-        item.addEventListener('click', (e) => {
-            e.preventDefault();
-            const page = item.dataset.page;
-            switchPage(page);
-        });
-    });
+# Загрузка переменных окружения
+load_dotenv()
 
-    // Кнопка "Запустить всё"
-    document.getElementById('runAllBtn')?.addEventListener('click', async function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        
-        if (isRunning) {
-            showToast('Скрининг уже выполняется, дождитесь завершения', 'warning');
-            return;
-        }
-        
-        const tickers = getTickers();
-        if (tickers.length === 0) {
-            showToast('Введите тикеры для скрининга', 'warning');
-            return;
-        }
-        
-        if (tickers.length > 1000) {
-            showToast('Максимум 1000 тикеров', 'error');
-            return;
-        }
-        
-        setRunningState(true);
-        showToast('Добавление всех скринеров в очередь...', 'info');
-        
-        try {
-            const screeners = [
-                {type: 'long', name: 'Long Setups'},
-                {type: 'squeeze', name: 'Short Squeeze'},
-                {type: 'oversold', name: 'Oversold Bounce'}
-            ];
-            
-            // Добавляем все скринеры в очередь (сервер выполнит их последовательно)
-            const jobIds = [];
-            for (const screener of screeners) {
-                const result = await addToQueue(screener.type, tickers);
-                if (result.success) {
-                    jobIds.push({job_id: result.job_id, name: screener.name});
-                    showToast(`${screener.name} добавлен в очередь (#${jobIds.length})`, 'success');
-                } else {
-                    showToast(`Ошибка добавления ${screener.name}: ${result.error}`, 'error');
-                }
-            }
-            
-            if (jobIds.length === 0) {
-                throw new Error('Не удалось добавить ни один скринер в очередь');
-            }
-            
-            showToast(`В очереди ${jobIds.length} скринеров. Сервер выполняет последовательно...`, 'info');
-            
-            // Ждем завершения всех скринеров (сервер выполняет их по очереди)
-            for (let i = 0; i < jobIds.length; i++) {
-                const job = jobIds[i];
-                showToast(`Ожидание завершения ${job.name} (${i+1}/${jobIds.length})...`, 'info');
-                await waitForJobCompletion(job.job_id);
-            }
-            
-            showToast('Все скринеры успешно завершены!', 'success');
-            
-        } catch (error) {
-            console.error('Error:', error);
-            showToast('Ошибка выполнения: ' + error.message, 'error');
-        } finally {
-            setRunningState(false);
-        }
-    });
+# Импорт модулей скринеров
+from modules.arbitrage import ArbitrageMonitor
+from modules.long_screener import LongScreener
+from modules.squeeze_screener import SqueezeScreener
+from modules.oversold_screener import OversoldScreener
 
-    // Отдельные кнопки скринеров
-    document.querySelectorAll('[data-screener]').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            
-            if (isRunning) {
-                showToast('Дождитесь завершения текущего скрининга', 'warning');
-                return;
-            }
-            
-            const type = btn.dataset.screener;
-            const tickers = getTickers();
-            
-            if (tickers.length === 0) {
-                showToast('Введите тикеры для скрининга', 'warning');
-                return;
-            }
-            
-            setRunningState(true);
-            
-            try {
-                const result = await addToQueue(type, tickers);
-                if (result.success) {
-                    await waitForJobCompletion(result.job_id);
-                    showToast(`${getScreenerName(type)} завершен!`, 'success');
-                }
-            } catch (error) {
-                showToast('Ошибка: ' + error.message, 'error');
-            } finally {
-                setRunningState(false);
-            }
-        });
-    });
+app = Flask(__name__)
 
-    // Очистка очереди
-    document.getElementById('clearQueueBtn')?.addEventListener('click', async () => {
-        try {
-            await fetch('/api/queue/clear', {method: 'POST'});
-            showToast('Очередь очищена', 'info');
-            setRunningState(false);
-        } catch (e) {
-            showToast('Ошибка очистки очереди', 'error');
-        }
-    });
+# Получение порта из переменных окружения (для Render)
+PORT = int(os.environ.get("PORT", "5000"))
 
-    // Загрузка S&P 500
-    document.getElementById('loadSp500Btn')?.addEventListener('click', () => {
-        const sp500 = ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'AVGO', 'WMT', 'JPM', 
-                      'V', 'PG', 'MA', 'UNH', 'HD', 'LLY', 'MRK', 'PEP', 'KO', 'ABBV'];
-        document.getElementById('tickerInput').value = sp500.join(', ');
-        updateTickerCount();
-    });
+# Создаем папки для сохранения данных
+os.makedirs('results', exist_ok=True)
+os.makedirs('history', exist_ok=True)
 
-    // Очистка тикеров
-    document.getElementById('clearTickersBtn')?.addEventListener('click', () => {
-        document.getElementById('tickerInput').value = '';
-        updateTickerCount();
-    });
+HISTORY_FILE = 'history/arbitrage_history.json'
+MAX_HISTORY_DAYS = 730
 
-    // Подсчет тикеров при вводе
-    document.getElementById('tickerInput')?.addEventListener('input', updateTickerCount);
-
-    // Закрытие модалки
-    document.getElementById('closeModalBtn')?.addEventListener('click', closeModal);
-    document.getElementById('chartModal')?.addEventListener('click', (e) => {
-        if (e.target.id === 'chartModal') closeModal();
-    });
-
-    // Экспорт CSV
-    document.getElementById('exportBtn')?.addEventListener('click', exportResults);
-    document.getElementById('clearAlertsBtn')?.addEventListener('click', clearResults);
-    
-    // ========== АВТОЗАПУСК ==========
-    setupAutorunListeners();
-    
-    // Горячие клавиши
-    document.addEventListener('keydown', (e) => {
-        if (e.ctrlKey && e.key === 'k') {
-            e.preventDefault();
-            document.getElementById('searchInput')?.focus();
-        }
-        if (e.key === 'Escape') {
-            closeModal();
-            closeAutorunDropdown();
-        }
-    });
+# ========== ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ ==========
+# Важные события для рынка акций США
+# Настройки предупреждений
+ECONOMIC_ALERT_SETTINGS = {
+    'critical_days': 1,      # Красный: за 1 день (сегодня/завтра)
+    'warning_days': 3,       # Оранжевый: за 3 дня
+    'info_days': 14,         # Обычный: за 14 дней
+    'ticker_days': 30        # Бегущая строка: за 30 дней
 }
 
-function setupAutorunListeners() {
-    const autorunBtn = document.getElementById('autorunBtn');
-    const autorunDropdown = document.getElementById('autorunDropdown');
-    const startBtn = document.getElementById('startAutorunBtn');
-    const stopBtn = document.getElementById('stopAutorunBtn');
-    const runNowBtn = document.getElementById('runNowBtn');
+# Даты важных экономических событий 2025-2026
+ECONOMIC_CALENDAR = [
+    # ========== FOMC MEETINGS (ВЫСОКОЕ ВЛИЯНИЕ) ==========
+    # FOMC Statement - заявление по процентной ставке
+    {'date': '2025-01-29', 'time': '14:00', 'event': 'FOMC Statement', 'impact': 'high', 'symbol': '🏦', 'type': 'FOMC'},
+    {'date': '2025-03-19', 'time': '14:00', 'event': 'FOMC Statement', 'impact': 'high', 'symbol': '🏦', 'type': 'FOMC'},
+    {'date': '2025-05-07', 'time': '14:00', 'event': 'FOMC Statement', 'impact': 'high', 'symbol': '🏦', 'type': 'FOMC'},
+    {'date': '2025-06-18', 'time': '14:00', 'event': 'FOMC Statement', 'impact': 'high', 'symbol': '🏦', 'type': 'FOMC'},
+    {'date': '2025-07-30', 'time': '14:00', 'event': 'FOMC Statement', 'impact': 'high', 'symbol': '🏦', 'type': 'FOMC'},
+    {'date': '2025-09-17', 'time': '14:00', 'event': 'FOMC Statement', 'impact': 'high', 'symbol': '🏦', 'type': 'FOMC'},
+    {'date': '2025-11-06', 'time': '14:00', 'event': 'FOMC Statement', 'impact': 'high', 'symbol': '🏦', 'type': 'FOMC'},
+    {'date': '2025-12-17', 'time': '14:00', 'event': 'FOMC Statement', 'impact': 'high', 'symbol': '🏦', 'type': 'FOMC'},
     
-    // Открыть/закрыть dropdown
-    autorunBtn?.addEventListener('click', (e) => {
-        e.stopPropagation();
-        autorunDropdown?.classList.toggle('show');
-    });
+    # FOMC Minutes - протоколы заседаний (через 3 недели)
+    {'date': '2025-02-19', 'time': '14:00', 'event': 'FOMC Minutes', 'impact': 'high', 'symbol': '📋', 'type': 'FOMC-MINUTES'},
+    {'date': '2025-04-09', 'time': '14:00', 'event': 'FOMC Minutes', 'impact': 'high', 'symbol': '📋', 'type': 'FOMC-MINUTES'},
+    {'date': '2025-05-28', 'time': '14:00', 'event': 'FOMC Minutes', 'impact': 'high', 'symbol': '📋', 'type': 'FOMC-MINUTES'},
+    {'date': '2025-07-09', 'time': '14:00', 'event': 'FOMC Minutes', 'impact': 'high', 'symbol': '📋', 'type': 'FOMC-MINUTES'},
+    {'date': '2025-08-27', 'time': '14:00', 'event': 'FOMC Minutes', 'impact': 'high', 'symbol': '📋', 'type': 'FOMC-MINUTES'},
+    {'date': '2025-10-08', 'time': '14:00', 'event': 'FOMC Minutes', 'impact': 'high', 'symbol': '📋', 'type': 'FOMC-MINUTES'},
+    {'date': '2025-11-26', 'time': '14:00', 'event': 'FOMC Minutes', 'impact': 'high', 'symbol': '📋', 'type': 'FOMC-MINUTES'},
     
-    // Закрыть при клике вне
-    document.addEventListener('click', (e) => {
-        if (!autorunDropdown?.contains(e.target) && e.target !== autorunBtn) {
-            closeAutorunDropdown();
-        }
-    });
+    # ========== NON-FARM PAYROLLS (ВЫСОКОЕ ВЛИЯНИЕ) ==========
+    # Первые пятницы месяца, 8:30 ET
+    {'date': '2025-04-04', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
+    {'date': '2025-05-02', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
+    {'date': '2025-06-06', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
+    {'date': '2025-07-03', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
+    {'date': '2025-08-01', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
+    {'date': '2025-09-05', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
+    {'date': '2025-10-03', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
+    {'date': '2025-11-07', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
+    {'date': '2025-12-05', 'time': '08:30', 'event': 'Non-Farm Payrolls', 'impact': 'high', 'symbol': '💼', 'type': 'NFP'},
     
-    // Запустить автозапуск
-    startBtn?.addEventListener('click', async () => {
-        const tickers = getTickers();
-        if (tickers.length === 0) {
-            showToast('Введите тикеры для автозапуска', 'warning');
-            return;
-        }
+    # ========== CPI - Consumer Price Index (ВЫСОКОЕ ВЛИЯНИЕ) ==========
+    # Около 10-15 числа каждого месяца, 8:30 ET
+    {'date': '2025-04-10', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    {'date': '2025-05-13', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    {'date': '2025-06-11', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    {'date': '2025-07-15', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    {'date': '2025-08-12', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    {'date': '2025-09-11', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    {'date': '2025-10-15', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    {'date': '2025-11-12', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    {'date': '2025-12-11', 'time': '08:30', 'event': 'CPI m/m', 'impact': 'high', 'symbol': '📈', 'type': 'CPI'},
+    
+    # ========== PPI - Producer Price Index (ВЫСОКОЕ ВЛИЯНИЕ) ==========
+    # Около 11-14 числа каждого месяца, 8:30 ET
+    {'date': '2025-04-11', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    {'date': '2025-05-13', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    {'date': '2025-06-12', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    {'date': '2025-07-15', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    {'date': '2025-08-13', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    {'date': '2025-09-11', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    {'date': '2025-10-14', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    {'date': '2025-11-13', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    {'date': '2025-12-12', 'time': '08:30', 'event': 'PPI m/m', 'impact': 'high', 'symbol': '🏭', 'type': 'PPI'},
+    
+    # ========== GDP - Gross Domestic Product (ВЫСОКОЕ ВЛИЯНИЕ) ==========
+    # Ежеквартально, предварительные данные
+    {'date': '2025-04-30', 'time': '08:30', 'event': 'GDP q/q (Preliminary)', 'impact': 'high', 'symbol': '🇺🇸', 'type': 'GDP'},
+    {'date': '2025-07-30', 'time': '08:30', 'event': 'GDP q/q (Preliminary)', 'impact': 'high', 'symbol': '🇺🇸', 'type': 'GDP'},
+    {'date': '2025-10-30', 'time': '08:30', 'event': 'GDP q/q (Preliminary)', 'impact': 'high', 'symbol': '🇺🇸', 'type': 'GDP'},
+    
+    # ========== RETAIL SALES (ВЫСОКОЕ ВЛИЯНИЕ) ==========
+    # Около 15 числа каждого месяца, 8:30 ET
+    {'date': '2025-04-15', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    {'date': '2025-05-15', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    {'date': '2025-06-17', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    {'date': '2025-07-16', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    {'date': '2025-08-15', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    {'date': '2025-09-16', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    {'date': '2025-10-16', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    {'date': '2025-11-14', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    {'date': '2025-12-16', 'time': '08:30', 'event': 'Retail Sales m/m', 'impact': 'high', 'symbol': '🛒', 'type': 'RETAIL'},
+    
+    # ========== INITIAL JOBLESS CLAIMS (СРЕДНЕЕ ВЛИЯНИЕ) ==========
+    # Каждый четверг, 8:30 ET
+    {'date': '2025-04-03', 'time': '08:30', 'event': 'Initial Jobless Claims', 'impact': 'medium', 'symbol': '📋', 'type': 'JOBLESS'},
+    {'date': '2025-04-10', 'time': '08:30', 'event': 'Initial Jobless Claims', 'impact': 'medium', 'symbol': '📋', 'type': 'JOBLESS'},
+    {'date': '2025-04-17', 'time': '08:30', 'event': 'Initial Jobless Claims', 'impact': 'medium', 'symbol': '📋', 'type': 'JOBLESS'},
+    {'date': '2025-04-24', 'time': '08:30', 'event': 'Initial Jobless Claims', 'impact': 'medium', 'symbol': '📋', 'type': 'JOBLESS'},
+    
+    # ========== FED CHAIR POWELL SPEECHES (ВЫСОКОЕ ВЛИЯНИЕ) ==========
+    {'date': '2025-03-07', 'time': '10:00', 'event': 'Fed Chair Powell Testimony', 'impact': 'high', 'symbol': '🎤', 'type': 'FED'},
+    {'date': '2025-06-24', 'time': '10:00', 'event': 'Fed Chair Powell Testimony', 'impact': 'high', 'symbol': '🎤', 'type': 'FED'},
+    {'date': '2025-07-16', 'time': '14:00', 'event': 'Fed Chair Powell Speech', 'impact': 'high', 'symbol': '🎤', 'type': 'FED'},
+    {'date': '2025-08-22', 'time': '10:00', 'event': 'Fed Chair Powell (Jackson Hole)', 'impact': 'high', 'symbol': '🎤', 'type': 'FED'},
+    
+    # ========== ISM MANUFACTURING (СРЕДНЕЕ ВЛИЯНИЕ) ==========
+    {'date': '2025-04-01', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    {'date': '2025-05-01', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    {'date': '2025-06-02', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    {'date': '2025-07-01', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    {'date': '2025-08-01', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    {'date': '2025-09-02', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    {'date': '2025-10-01', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    {'date': '2025-11-03', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    {'date': '2025-12-01', 'time': '10:00', 'event': 'ISM Manufacturing PMI', 'impact': 'medium', 'symbol': '🏭', 'type': 'ISM'},
+    
+    # ========== CONSUMER CONFIDENCE (СРЕДНЕЕ ВЛИЯНИЕ) ==========
+    {'date': '2025-04-29', 'time': '10:00', 'event': 'Consumer Confidence', 'impact': 'medium', 'symbol': '💰', 'type': 'CONFIDENCE'},
+    {'date': '2025-05-27', 'time': '10:00', 'event': 'Consumer Confidence', 'impact': 'medium', 'symbol': '💰', 'type': 'CONFIDENCE'},
+    {'date': '2025-06-24', 'time': '10:00', 'event': 'Consumer Confidence', 'impact': 'medium', 'symbol': '💰', 'type': 'CONFIDENCE'},
+    {'date': '2025-07-29', 'time': '10:00', 'event': 'Consumer Confidence', 'impact': 'medium', 'symbol': '💰', 'type': 'CONFIDENCE'},
+    {'date': '2025-08-26', 'time': '10:00', 'event': 'Consumer Confidence', 'impact': 'medium', 'symbol': '💰', 'type': 'CONFIDENCE'},
+    {'date': '2025-09-30', 'time': '10:00', 'event': 'Consumer Confidence', 'impact': 'medium', 'symbol': '💰', 'type': 'CONFIDENCE'},
+    {'date': '2025-10-28', 'time': '10:00', 'event': 'Consumer Confidence', 'impact': 'medium', 'symbol': '💰', 'type': 'CONFIDENCE'},
+    {'date': '2025-11-25', 'time': '10:00', 'event': 'Consumer Confidence', 'impact': 'medium', 'symbol': '💰', 'type': 'CONFIDENCE'},
+    
+    # ========== HOUSING STARTS (СРЕДНЕЕ ВЛИЯНИЕ) ==========
+    {'date': '2025-04-17', 'time': '08:30', 'event': 'Housing Starts', 'impact': 'medium', 'symbol': '🏠', 'type': 'HOUSING'},
+    {'date': '2025-05-16', 'time': '08:30', 'event': 'Housing Starts', 'impact': 'medium', 'symbol': '🏠', 'type': 'HOUSING'},
+    {'date': '2025-06-17', 'time': '08:30', 'event': 'Housing Starts', 'impact': 'medium', 'symbol': '🏠', 'type': 'HOUSING'},
+    {'date': '2025-07-17', 'time': '08:30', 'event': 'Housing Starts', 'impact': 'medium', 'symbol': '🏠', 'type': 'HOUSING'},
+    {'date': '2025-08-19', 'time': '08:30', 'event': 'Housing Starts', 'impact': 'medium', 'symbol': '🏠', 'type': 'HOUSING'},
+    {'date': '2025-09-17', 'time': '08:30', 'event': 'Housing Starts', 'impact': 'medium', 'symbol': '🏠', 'type': 'HOUSING'},
+    {'date': '2025-10-17', 'time': '08:30', 'event': 'Housing Starts', 'impact': 'medium', 'symbol': '🏠', 'type': 'HOUSING'},
+    {'date': '2025-11-18', 'time': '08:30', 'event': 'Housing Starts', 'impact': 'medium', 'symbol': '🏠', 'type': 'HOUSING'},
+    
+    # ========== INDUSTRIAL PRODUCTION (СРЕДНЕЕ ВЛИЯНИЕ) ==========
+    {'date': '2025-04-16', 'time': '09:15', 'event': 'Industrial Production', 'impact': 'medium', 'symbol': '⚙️', 'type': 'INDUSTRIAL'},
+    {'date': '2025-05-15', 'time': '09:15', 'event': 'Industrial Production', 'impact': 'medium', 'symbol': '⚙️', 'type': 'INDUSTRIAL'},
+    {'date': '2025-06-17', 'time': '09:15', 'event': 'Industrial Production', 'impact': 'medium', 'symbol': '⚙️', 'type': 'INDUSTRIAL'},
+    {'date': '2025-07-16', 'time': '09:15', 'event': 'Industrial Production', 'impact': 'medium', 'symbol': '⚙️', 'type': 'INDUSTRIAL'},
+    {'date': '2025-08-15', 'time': '09:15', 'event': 'Industrial Production', 'impact': 'medium', 'symbol': '⚙️', 'type': 'INDUSTRIAL'},
+    {'date': '2025-09-16', 'time': '09:15', 'event': 'Industrial Production', 'impact': 'medium', 'symbol': '⚙️', 'type': 'INDUSTRIAL'},
+    {'date': '2025-10-16', 'time': '09:15', 'event': 'Industrial Production', 'impact': 'medium', 'symbol': '⚙️', 'type': 'INDUSTRIAL'},
+    {'date': '2025-11-14', 'time': '09:15', 'event': 'Industrial Production', 'impact': 'medium', 'symbol': '⚙️', 'type': 'INDUSTRIAL'},
+    
+    # ========== UNEMPLOYMENT RATE (ВЫСОКОЕ ВЛИЯНИЕ) ==========
+    {'date': '2025-04-04', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+    {'date': '2025-05-02', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+    {'date': '2025-06-06', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+    {'date': '2025-07-03', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+    {'date': '2025-08-01', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+    {'date': '2025-09-05', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+    {'date': '2025-10-03', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+    {'date': '2025-11-07', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+    {'date': '2025-12-05', 'time': '08:30', 'event': 'Unemployment Rate', 'impact': 'high', 'symbol': '📉', 'type': 'UNEMPLOYMENT'},
+]
+
+# Глобальное состояние
+screening_state = {
+    'queue': [],
+    'running': False,
+    'current_job': None,
+    'progress': {'job_id': None, 'current': 0, 'total': 0, 'ticker': '', 'status': 'idle', 'percent': 0},
+    'results': {},
+    'logs': []
+}
+
+# Состояние автозапуска
+autorun_state = {
+    'enabled': False,
+    'interval_hours': 1,
+    'tickers': [],
+    'screeners': ['long', 'squeeze', 'oversold'],
+    'last_run': None,
+    'next_run': None,
+    'run_count': 0,
+    'total_signals_found': 0
+}
+autorun_lock = threading.Lock()
+
+arbitrage_history = []
+last_arbitrage_update = None
+history_lock = threading.Lock()
+
+arb_monitor = ArbitrageMonitor()
+long_screener = LongScreener()
+squeeze_screener = SqueezeScreener()
+oversold_screener = OversoldScreener()
+
+lock = threading.Lock()
+
+def get_ny_time():
+    """Получить текущее время в Нью-Йорке (EST/EDT)"""
+    # Получаем UTC время
+    utc_now = datetime.now(timezone.utc)
+    # EST = UTC-5, EDT = UTC-4 (летнее время)
+    # Для простоты используем EST (UTC-5) - зимнее время
+    # Летнее время: UTC-4 (март-ноябрь)
+    
+    # Определяем, действует ли сейчас летнее время (EDT)
+    # EDT: второе воскресенье марта - первое воскресенье ноября
+    year = utc_now.year
+    
+    # Второе воскресенье марта
+    march_second_sunday = datetime(year, 3, 8, 7, 0, tzinfo=timezone.utc)  # 2:00 AM EST = 7:00 AM UTC
+    while march_second_sunday.weekday() != 6:  # 6 = воскресенье
+        march_second_sunday += timedelta(days=1)
+    
+    # Первое воскресенье ноября
+    november_first_sunday = datetime(year, 11, 1, 6, 0, tzinfo=timezone.utc)  # 1:00 AM EST = 6:00 AM UTC
+    while november_first_sunday.weekday() != 6:
+        november_first_sunday += timedelta(days=1)
+    
+    # Проверяем, действует ли EDT
+    is_edt = march_second_sunday <= utc_now < november_first_sunday
+    
+    # Смещение: EST = -5, EDT = -4
+    offset_hours = -4 if is_edt else -5
+    
+    ny_time = utc_now + timedelta(hours=offset_hours)
+    return ny_time, offset_hours
+
+def is_market_open():
+    """Проверка открыт ли рынок NYSE (по времени Нью-Йорка)"""
+    ny_time, offset = get_ny_time()
+    weekday = ny_time.weekday()
+    
+    # Выходные: суббота(5), воскресенье(6)
+    if weekday >= 5:
+        return False
+    
+    # Рынок открыт: 9:30 - 16:00 EST/EDT
+    hour = ny_time.hour
+    minute = ny_time.minute
+    
+    # 9:30 = открытие
+    if hour == 9 and minute >= 30:
+        return True
+    if 10 <= hour < 16:
+        return True
+    
+    return False
+
+def get_next_market_open():
+    """Время до открытия рынка"""
+    ny_time, offset = get_ny_time()
+    
+    if is_market_open():
+        return "Открыт", "var(--success)"
+    
+    # Находим следующий рабочий день
+    next_day = ny_time
+    days_added = 0
+    while next_day.weekday() >= 5:  # Пропускаем выходные
+        next_day += timedelta(days=1)
+        days_added += 1
+    
+    # Если сегодня будний день, но рынок уже закрылся
+    if days_added == 0 and ny_time.hour >= 16:
+        next_day += timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+    
+    return f"Закрыт (откроется {next_day.strftime('%d.%m')} 9:30)", "var(--danger)"
+
+def get_economic_events_for_ticker():
+    """
+    Получение экономических событий для бегущей строки
+    Возвращает события с информацией о днях до события
+    """
+    now = datetime.now()
+    upcoming = []
+    settings = ECONOMIC_ALERT_SETTINGS
+    
+    for event in ECONOMIC_CALENDAR:
+        event_date = datetime.strptime(event['date'], '%Y-%m-%d')
+        days_until = (event_date - now).days
+        hours_until = days_until * 24 + (event_date.hour - now.hour)
         
-        const interval = parseInt(document.getElementById('autorunInterval')?.value || '1');
-        const screeners = Array.from(document.querySelectorAll('.autorun-screeners input:checked'))
-            .map(cb => cb.value);
-        
-        if (screeners.length === 0) {
-            showToast('Выберите хотя бы один скринер', 'warning');
-            return;
-        }
-        
-        try {
-            const response = await fetch('/api/autorun/start', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({tickers, interval_hours: interval, screeners})
-            });
+        # Показываем события в пределах ticker_days (30 дней)
+        if -1 <= days_until <= settings['ticker_days']:
+            is_today = days_until == 0
+            is_tomorrow = days_until == 1
+            is_this_week = days_until <= 7
             
-            const data = await response.json();
+            # Определяем уровень предупреждения
+            if days_until <= settings['critical_days']:
+                alert_level = 'critical'  # Красный: сегодня/завтра
+            elif days_until <= settings['warning_days']:
+                alert_level = 'warning'   # Оранжевый: 2-3 дня
+            else:
+                alert_level = 'info'      # Обычный: > 3 дней
             
-            if (data.success) {
-                showToast(`Автозапуск включен! Период: ${interval}ч`, 'success');
-                updateAutorunUI(true);
-                loadAutorunStatus();
-            } else {
-                showToast(data.error || 'Ошибка запуска автозапуска', 'error');
-            }
-        } catch (e) {
-            showToast('Ошибка сети', 'error');
-        }
-    });
+            upcoming.append({
+                **event,
+                'days_until': days_until,
+                'hours_until': hours_until,
+                'is_today': is_today,
+                'is_tomorrow': is_tomorrow,
+                'is_this_week': is_this_week,
+                'urgent': days_until <= settings['critical_days'],
+                'alert_level': alert_level
+            })
     
-    // Остановить автозапуск
-    stopBtn?.addEventListener('click', async () => {
-        try {
-            const response = await fetch('/api/autorun/stop', {method: 'POST'});
-            const data = await response.json();
+    return sorted(upcoming, key=lambda x: x['days_until'])
+
+def check_upcoming_events():
+    """Проверка приближающихся важных событий для панели"""
+    now = datetime.now()
+    upcoming = []
+    settings = ECONOMIC_ALERT_SETTINGS
+    
+    for event in ECONOMIC_CALENDAR:
+        event_date = datetime.strptime(event['date'], '%Y-%m-%d')
+        days_until = (event_date - now).days
+        
+        # Показываем события в пределах info_days (14 дней)
+        if 0 <= days_until <= settings['info_days']:
+            # Определяем уровень предупреждения
+            if days_until <= settings['critical_days']:
+                alert_level = 'critical'
+            elif days_until <= settings['warning_days']:
+                alert_level = 'warning'
+            else:
+                alert_level = 'info'
             
-            if (data.success) {
-                showToast('Автозапуск остановлен', 'info');
-                showToast(`Статистика: ${data.stats.total_runs} запусков, ${data.stats.total_signals} сигналов`, 'info');
-                updateAutorunUI(false);
-                loadAutorunStatus();
-            }
-        } catch (e) {
-            showToast('Ошибка остановки', 'error');
-        }
-    });
+            upcoming.append({
+                **event,
+                'days_until': days_until,
+                'urgent': days_until <= settings['critical_days'],
+                'alert_level': alert_level
+            })
     
-    // Запустить сейчас
-    runNowBtn?.addEventListener('click', async () => {
-        const tickers = getTickers();
-        if (tickers.length === 0) {
-            showToast('Введите тикеры', 'warning');
-            return;
-        }
+    return sorted(upcoming, key=lambda x: x['days_until'])
+
+def save_screening_to_excel(job_id, results, screener_type):
+    """Сохранение результатов скрининга в CSV"""
+    if not results:
+        return None
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f"{screener_type}_{timestamp}_{job_id}.csv"
+    filepath = os.path.join('results', filename)
+    
+    try:
+        if len(results) > 0:
+            fieldnames = list(results[0].keys())
+        else:
+            fieldnames = ['ticker', 'grade', 'price', 'score']
         
-        const screeners = Array.from(document.querySelectorAll('.autorun-screeners input:checked'))
-            .map(cb => cb.value);
+        with open(filepath, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in results:
+                writer.writerow(row)
         
-        if (screeners.length === 0) {
-            showToast('Выберите хотя бы один скринер', 'warning');
-            return;
-        }
+        print(f"💾 Сохранено: {filepath}")
+        return filepath
+    except Exception as e:
+        print(f"❌ Ошибка сохранения: {e}")
+        return None
+
+def log_message(msg):
+    with lock:
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        screening_state['logs'].insert(0, f"[{timestamp}] {msg}")
+        if len(screening_state['logs']) > 50:
+            screening_state['logs'] = screening_state['logs'][:50]
+
+def load_arbitrage_history():
+    global arbitrage_history, last_arbitrage_update
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                data = json.load(f)
+                arbitrage_history = data.get('data', [])
+                last_update = data.get('last_update')
+                if last_update:
+                    last_arbitrage_update = datetime.fromisoformat(last_update)
+                print(f"✅ Загружено {len(arbitrage_history)} точек истории")
+                clean_old_history()
+        else:
+            arbitrage_history = []
+    except Exception as e:
+        print(f"❌ Ошибка загрузки истории: {e}")
+        arbitrage_history = []
+
+def save_arbitrage_history():
+    try:
+        with history_lock:
+            data = {
+                'last_update': datetime.now().isoformat(),
+                'count': len(arbitrage_history),
+                'data': arbitrage_history
+            }
+            temp_file = HISTORY_FILE + '.tmp'
+            with open(temp_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            os.replace(temp_file, HISTORY_FILE)
+            return True
+    except Exception as e:
+        print(f"❌ Ошибка сохранения: {e}")
+        return False
+
+def clean_old_history():
+    global arbitrage_history
+    cutoff_date = datetime.now() - timedelta(days=MAX_HISTORY_DAYS)
+    original_count = len(arbitrage_history)
+    arbitrage_history = [
+        item for item in arbitrage_history 
+        if datetime.fromisoformat(item.get('timestamp', '2000-01-01')) > cutoff_date
+    ]
+    if len(arbitrage_history) < original_count:
+        print(f"🧹 Удалено {original_count - len(arbitrage_history)} старых точек")
+
+def auto_save_worker():
+    while True:
+        time.sleep(300)
+        if arbitrage_history:
+            if save_arbitrage_history():
+                print(f"💾 Автосохранение: {len(arbitrage_history)} точек")
+
+def worker_thread():
+    """Главный поток - выполняет задачи последовательно (чтобы не банили)"""
+    while True:
+        job = None
         
-        try {
-            const response = await fetch('/api/autorun/run-now', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({tickers, screeners})
-            });
+        with lock:
+            if screening_state['queue'] and not screening_state['running']:
+                job = screening_state['queue'].pop(0)
+                screening_state['running'] = True
+                screening_state['current_job'] = job
+        
+        if job:
+            job_id = job['id']
+            screener_type = job['type']
+            tickers = job['tickers']
             
-            const data = await response.json();
+            log_message(f"🚀 Старт {screener_type}: {len(tickers)} тикеров")
+            screening_state['progress'] = {
+                'job_id': job_id, 'current': 0, 'total': len(tickers), 
+                'ticker': '-', 'status': 'running', 'percent': 0
+            }
             
-            if (data.success) {
-                showToast(`${data.job_ids.length} скринеров добавлены в очередь`, 'success');
-                setRunningState(true);
-                closeAutorunDropdown();
-            } else {
-                showToast(data.error || 'Ошибка', 'error');
-            }
-        } catch (e) {
-            showToast('Ошибка сети', 'error');
-        }
-    });
-}
-
-function closeAutorunDropdown() {
-    document.getElementById('autorunDropdown')?.classList.remove('show');
-}
-
-async function loadAutorunStatus() {
-    try {
-        const response = await fetch('/api/autorun/status');
-        const data = await response.json();
-        
-        updateAutorunUI(data.enabled);
-        
-        // Обновляем статистику
-        const statsEl = document.getElementById('autorunStats');
-        const runCountEl = document.getElementById('autorunRunCount');
-        const signalsEl = document.getElementById('autorunSignals');
-        const nextRunEl = document.getElementById('autorunNextRun');
-        
-        if (data.enabled) {
-            statsEl?.classList.remove('hidden');
-            if (runCountEl) runCountEl.textContent = data.run_count || 0;
-            if (signalsEl) signalsEl.textContent = data.total_signals_found || 0;
-            if (nextRunEl && data.next_run) {
-                const nextDate = new Date(data.next_run);
-                nextRunEl.textContent = nextDate.toLocaleTimeString('ru-RU', {hour: '2-digit', minute: '2-digit'});
-            }
-        } else {
-            statsEl?.classList.add('hidden');
-        }
-        
-    } catch (e) {
-        console.error('Autorun status error:', e);
-    }
-}
-
-function updateAutorunUI(enabled) {
-    const btn = document.getElementById('autorunBtn');
-    const startBtn = document.getElementById('startAutorunBtn');
-    const stopBtn = document.getElementById('stopAutorunBtn');
-    const statusEl = document.getElementById('autorunStatus');
-    const statsEl = document.getElementById('autorunStats');
-    
-    if (enabled) {
-        btn?.classList.add('active');
-        startBtn?.classList.add('hidden');
-        stopBtn?.classList.remove('hidden');
-        if (statusEl) statusEl.innerHTML = '<span class="status-on">● Работает</span>';
-        statsEl?.classList.remove('hidden');
-    } else {
-        btn?.classList.remove('active');
-        startBtn?.classList.remove('hidden');
-        stopBtn?.classList.add('hidden');
-        if (statusEl) statusEl.innerHTML = '<span class="status-off">Выключен</span>';
-        statsEl?.classList.add('hidden');
-    }
-}
-
-// ========== БЕГУЩАЯ СТРОКА ЭКОНОМИЧЕСКИХ СОБЫТИЙ ==========
-
-async function loadEconomicTicker() {
-    try {
-        const response = await fetch('/api/economic-ticker');
-        const data = await response.json();
-        
-        if (data.events && data.events.length > 0) {
-            updateEconomicTicker(data.events, data.has_critical);
-        } else {
-            document.getElementById('econTicker').innerHTML = 
-                '<span class="ticker-item info">Нет ближайших экономических событий</span>';
-        }
-    } catch (e) {
-        console.error('Economic ticker error:', e);
-    }
-}
-
-function updateEconomicTicker(events, hasCritical) {
-    const container = document.getElementById('econTickerContainer');
-    const ticker = document.getElementById('econTicker');
-    const alert = document.getElementById('econTickerAlert');
-    
-    // Проверяем наличие критических событий (сегодня или завтра)
-    const criticalEvents = events.filter(e => e.alert_level === 'critical');
-    const warningEvents = events.filter(e => e.alert_level === 'warning');
-    
-    // Обновляем стиль контейнера
-    container.classList.remove('critical', 'warning');
-    if (criticalEvents.length > 0) {
-        container.classList.add('critical');
-        alert.classList.remove('hidden');
-    } else if (warningEvents.length > 0) {
-        container.classList.add('warning');
-        alert.classList.remove('hidden');
-    } else {
-        alert.classList.add('hidden');
-    }
-    
-    // Формируем элементы бегущей строки
-    const tickerItems = events.map(event => {
-        const alertClass = event.alert_level;
-        const daysText = event.is_today ? 'СЕГОДНЯ!' : 
-                        event.is_tomorrow ? 'ЗАВТРА!' : 
-                        `через ${event.days_until} дн.`;
-        
-        return `
-            <span class="ticker-item ${alertClass}">
-                <span class="event-symbol">${event.symbol}</span>
-                <span class="event-type">${event.type}</span>
-                <span class="event-name">${event.event}</span>
-                <span class="event-date">${event.date} ${event.time}</span>
-                <span class="countdown">${daysText}</span>
-            </span>
-        `;
-    });
-    
-    // Дублируем для бесконечной прокрутки
-    ticker.innerHTML = [...tickerItems, ...tickerItems].join('<span class="ticker-separator">•</span>');
-}
-
-// ========== ОСТАЛЬНЫЕ ФУНКЦИИ ==========
-
-function setRunningState(running) {
-    isRunning = running;
-    
-    const buttons = [
-        document.getElementById('runAllBtn'),
-        ...document.querySelectorAll('[data-screener]')
-    ].filter(Boolean);
-    
-    buttons.forEach(btn => {
-        btn.disabled = running;
-        if (running) {
-            btn.classList.add('btn-disabled');
-            if (!btn.dataset.originalText) {
-                btn.dataset.originalText = btn.innerHTML;
-            }
-            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Выполняется...';
-        } else {
-            btn.classList.remove('btn-disabled');
-            if (btn.dataset.originalText) {
-                btn.innerHTML = btn.dataset.originalText;
-            }
-        }
-    });
-    
-    const progressPanel = document.getElementById('progressContainer');
-    if (progressPanel) {
-        if (running) {
-            progressPanel.classList.remove('hidden');
-        } else {
-            setTimeout(() => {
-                if (!isRunning) progressPanel.classList.add('hidden');
-            }, 2000);
-        }
-    }
-}
-
-async function waitForJobCompletion(jobId) {
-    return new Promise((resolve, reject) => {
-        let checkCount = 0;
-        const maxChecks = 3600;
-        
-        const interval = setInterval(async () => {
-            try {
-                checkCount++;
+            results = []
+            start_time = time.time()
+            
+            try:
+                for i, ticker in enumerate(tickers):
+                    try:
+                        screening_state['progress'].update({
+                            'current': i + 1,
+                            'ticker': ticker,
+                            'percent': round((i + 1) / len(tickers) * 100, 1)
+                        })
+                        
+                        if i % 10 == 0:
+                            log_message(f"Прогресс: {i+1}/{len(tickers)}...")
+                        
+                        result = None
+                        if screener_type == 'long':
+                            result = long_screener.analyze_ticker(ticker)
+                        elif screener_type == 'squeeze':
+                            result = squeeze_screener.analyze_ticker(ticker)
+                        elif screener_type == 'oversold':
+                            result = oversold_screener.analyze_ticker(ticker)
+                        
+                        if result and result.get('grade') not in ['PASS', '👀 WATCH', '❌ DOWNTREND']:
+                            results.append(result)
+                            log_message(f"✅ Сигнал: {ticker} - {result.get('grade')}")
+                        
+                        # Задержка между тикерами чтобы не банили
+                        if i < len(tickers) - 1:
+                            time.sleep(0.5)
+                            
+                    except Exception as e:
+                        log_message(f"❌ {ticker}: {str(e)[:30]}")
+                        continue
                 
-                if (checkCount > maxChecks) {
-                    clearInterval(interval);
-                    reject(new Error('Timeout waiting for job completion'));
-                    return;
-                }
+                elapsed = round(time.time() - start_time, 1)
                 
-                const response = await fetch(`/api/queue/results/${jobId}`);
+                saved_file = save_screening_to_excel(job_id, results, screener_type)
+                if saved_file:
+                    log_message(f"💾 Сохранено в: {os.path.basename(saved_file)}")
                 
-                if (response.status === 200) {
-                    clearInterval(interval);
-                    const data = await response.json();
-                    if (data.data && data.data.length > 0) {
-                        displayResultsInTable(data.data, data.type);
-                        updateBadge(data.type, data.count);
+                with lock:
+                    screening_state['results'][job_id] = {
+                        'type': screener_type,
+                        'completed_at': datetime.now().isoformat(),
+                        'elapsed_seconds': elapsed,
+                        'saved_file': saved_file,
+                        'count': len(results),
+                        'data': sorted(results, key=lambda x: x.get('score', 0), reverse=True)
                     }
-                    resolve(data);
-                } else if (response.status === 202) {
-                    const status = await fetch('/api/queue/status').then(r => r.json());
-                    updateProgressUI(status.progress);
+                
+                screening_state['progress']['status'] = 'completed'
+                screening_state['progress']['percent'] = 100
+                
+                log_message(f"✨ Готово! {len(results)} сигналов за {elapsed}s")
+                
+            except Exception as e:
+                log_message(f"🔥 Ошибка: {str(e)[:50]}")
+            
+            finally:
+                # Важно: сбрасываем флаг running чтобы следующая задача запустилась
+                with lock:
+                    screening_state['running'] = False
+                    screening_state['current_job'] = None
+        
+        time.sleep(0.5)
+
+def autorun_worker():
+    """Рабочий поток автозапуска скринеров"""
+    global autorun_state
+    
+    while True:
+        try:
+            with autorun_lock:
+                if not autorun_state['enabled']:
+                    time.sleep(5)
+                    continue
+                
+                now = datetime.now()
+                
+                # Проверяем, нужно ли запустить
+                if autorun_state['next_run'] is None:
+                    # Первый запуск - через interval_hours
+                    autorun_state['next_run'] = now + timedelta(hours=autorun_state['interval_hours'])
+                    log_message(f"⏰ Автозапуск активирован. Следующий запуск: {autorun_state['next_run'].strftime('%H:%M:%S')}")
+                    continue
+                
+                # Проверяем время следующего запуска
+                if now >= autorun_state['next_run']:
+                    # Проверяем, не идет ли уже скрининг
+                    if screening_state['running'] or screening_state['queue']:
+                        log_message("⏳ Автозапуск отложен - скрининг уже выполняется")
+                        # Откладываем на 5 минут
+                        autorun_state['next_run'] = now + timedelta(minutes=5)
+                        continue
                     
-                    if (status.logs) {
-                        updateLogs(status.logs);
-                    }
-                } else {
-                    clearInterval(interval);
-                    const error = await response.text();
-                    reject(new Error(error));
-                }
-            } catch (error) {
-                clearInterval(interval);
-                reject(error);
-            }
-        }, 1000);
-    });
-}
-
-async function checkQueueStatus() {
-    try {
-        const response = await fetch('/api/queue/status');
-        const data = await response.json();
-        
-        if (data.running && !isRunning) {
-            setRunningState(true);
-        }
-        
-        if (!data.running && isRunning && data.queue_length === 0) {
-            setTimeout(async () => {
-                const check = await fetch('/api/queue/status').then(r => r.json());
-                if (!check.running && check.queue_length === 0) {
-                    setRunningState(false);
-                }
-            }, 1000);
-        }
-        
-        updateProgressUI(data.progress);
-        
-    } catch (e) {
-        console.error('Status check error:', e);
-    }
-}
-
-async function addToQueue(type, tickers) {
-    try {
-        const response = await fetch('/api/queue/add', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({type, tickers})
-        });
-        
-        const data = await response.json();
-        
-        if (!response.ok) {
-            throw new Error(data.error || 'Failed to add to queue');
-        }
-        
-        return data;
-    } catch (error) {
-        console.error('Add to queue error:', error);
-        throw error;
-    }
-}
-
-function updateProgressUI(progress) {
-    if (!progress) return;
-    
-    const percent = document.getElementById('progressPercent');
-    const bar = document.getElementById('progressBar');
-    const ticker = document.getElementById('progressTicker');
-    const count = document.getElementById('progressCount');
-    const title = document.getElementById('progressTitle');
-    
-    if (percent) percent.textContent = progress.percent + '%';
-    if (bar) bar.style.width = progress.percent + '%';
-    if (ticker) ticker.textContent = progress.ticker || '-';
-    if (count) count.textContent = `${progress.current}/${progress.total}`;
-    if (title) title.textContent = progress.status === 'completed' ? 'Завершено' : 'Обработка...';
-}
-
-function updateLogs(logs) {
-    const container = document.getElementById('progressLogs');
-    if (!container || !logs) return;
-    
-    container.innerHTML = logs.slice(0, 20).map(log => 
-        `<div class="log-item">${escapeHtml(log)}</div>`
-    ).join('');
-}
-
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-function getTickers() {
-    const input = document.getElementById('tickerInput');
-    if (!input || !input.value.trim()) return [];
-    
-    return input.value
-        .split(/[,\n]/)
-        .map(t => t.trim().toUpperCase())
-        .filter(t => t.length > 0 && t.length <= 5 && /^[A-Z]+$/.test(t));
-}
-
-function updateTickerCount() {
-    const count = getTickers().length;
-    const element = document.getElementById('tickerCount');
-    if (element) element.textContent = count;
-}
-
-function getScreenerName(type) {
-    const names = {
-        'long': 'Long Setups',
-        'squeeze': 'Short Squeeze',
-        'oversold': 'Oversold Bounce'
-    };
-    return names[type] || type;
-}
-
-function displayResultsInTable(results, type) {
-    const tbody = document.getElementById('resultsTableBody');
-    if (!tbody) return;
-    
-    if (!results || results.length === 0) {
-        tbody.innerHTML = `
-            <tr class="empty-row">
-                <td colspan="6">
-                    <div class="empty-state">
-                        <i class="fas fa-inbox"></i>
-                        <p>Нет сигналов для отображения</p>
-                    </div>
-                </td>
-            </tr>`;
-        return;
-    }
-    
-    const rows = results.map(item => {
-        let details = '';
-        if (item.trend) details += `Тренд: ${item.trend}<br>`;
-        if (item.rsi) details += `RSI: ${item.rsi}<br>`;
-        if (item.rvol) details += `RVOL: ${item.rvol}x<br>`;
-        if (item.pe) details += `P/E: ${item.pe}<br>`;
-        if (item.drop_5d) details += `Падение: ${item.drop_5d}%<br>`;
-        if (item.level_info) details += `Уровень: ${item.level_info}`;
-        
-        const gradeClass = (item.grade && (
-            item.grade.includes('BUY') || 
-            item.grade.includes('BREAKOUT') || 
-            item.grade.includes('BOUNCE') ||
-            item.grade.includes('PERFECT') ||
-            item.grade.includes('STRONG')
-        )) ? 'buy' : 'watch';
-        
-        return `
-            <tr data-ticker="${item.ticker}">
-                <td>
-                    <strong class="ticker-link" onclick="openChartModal('${item.ticker}')" 
-                            style="cursor: pointer; color: var(--primary);">
-                        ${item.ticker}
-                    </strong>
-                </td>
-                <td>
-                    <span class="grade-badge ${gradeClass}">${item.grade}</span>
-                </td>
-                <td>$${item.price}</td>
-                <td><span class="score">${item.score}</span></td>
-                <td class="details-cell">${details || '-'}</td>
-                <td>
-                    <button class="btn-icon-small" onclick="openChartModal('${item.ticker}')" 
-                            title="Открыть график ${item.ticker}">
-                        <i class="fas fa-chart-line"></i>
-                    </button>
-                </td>
-            </tr>
-        `;
-    }).join('');
-    
-    tbody.innerHTML = rows;
-    
-    displayResultsInGrid(type, results);
-}
-
-function displayResultsInGrid(type, results) {
-    const containerId = type === 'long' ? 'longResults' : 
-                       type === 'squeeze' ? 'squeezeResults' : 
-                       type === 'oversold' ? 'oversoldResults' : null;
-    
-    if (!containerId) return;
-    
-    const container = document.getElementById(containerId);
-    if (!container) return;
-    
-    if (!results || results.length === 0) {
-        container.innerHTML = '<div class="empty-state">Нет результатов</div>';
-        return;
-    }
-    
-    const cards = results.map(item => {
-        const gradeClass = (item.grade && (
-            item.grade.includes('BUY') || 
-            item.grade.includes('BREAKOUT') || 
-            item.grade.includes('BOUNCE') ||
-            item.grade.includes('PERFECT') ||
-            item.grade.includes('STRONG')
-        )) ? 'buy' : 'watch';
-        
-        return `
-            <div class="result-card" onclick="openChartModal('${item.ticker}')" 
-                 style="cursor: pointer;">
-                <div class="result-header">
-                    <span class="ticker">${item.ticker}</span>
-                    <span class="grade ${gradeClass}">${item.grade}</span>
-                </div>
-                <div class="result-price">$${item.price}</div>
-                <div class="result-metrics">
-                    <div class="metric"><span>Скор:</span><strong>${item.score}</strong></div>
-                    ${item.rsi ? `<div class="metric"><span>RSI:</span><strong>${item.rsi}</strong></div>` : ''}
-                    ${item.rvol ? `<div class="metric"><span>RVOL:</span><strong>${item.rvol}x</strong></div>` : ''}
-                    ${item.pe ? `<div class="metric"><span>P/E:</span><strong>${item.pe}</strong></div>` : ''}
-                    ${item.drop_5d ? `<div class="metric"><span>Падение:</span><strong>${item.drop_5d}%</strong></div>` : ''}
-                    ${item.potential ? `<div class="metric"><span>Потенциал:</span><strong>+${item.potential}%</strong></div>` : ''}
-                </div>
-            </div>
-        `;
-    }).join('');
-    
-    container.innerHTML = cards;
-}
-
-function updateBadge(type, count) {
-    const badgeMap = {
-        'long': 'longCount',
-        'squeeze': 'squeezeCount',
-        'oversold': 'oversoldCount'
-    };
-    
-    const badgeId = badgeMap[type];
-    if (!badgeId) return;
-    
-    const badge = document.getElementById(badgeId);
-    if (badge) {
-        badge.textContent = `${count} сигналов`;
-        badge.style.background = count > 0 ? '#d1fae5' : '';
-        badge.style.color = count > 0 ? '#065f46' : '';
-    }
-}
-
-async function openChartModal(ticker) {
-    const modal = document.getElementById('chartModal');
-    const title = document.getElementById('modalTicker');
-    const company = document.getElementById('modalCompany');
-    const sector = document.getElementById('modalSector');
-    const price = document.getElementById('modalPrice');
-    
-    if (!modal) return;
-    
-    modal.classList.remove('hidden');
-    title.textContent = ticker;
-    company.textContent = 'Загрузка...';
-    sector.textContent = '-';
-    price.textContent = '-';
-    
-    try {
-        const response = await fetch(`/api/chart-data/${ticker}`);
-        const data = await response.json();
-        
-        if (data.error) {
-            showToast('Ошибка загрузки данных', 'error');
-            closeModal();
-            return;
-        }
-        
-        company.textContent = data.info?.name || ticker;
-        sector.textContent = data.info?.sector || '-';
-        price.textContent = data.info?.marketCap ? 
-            `$${(data.info.marketCap / 1e9).toFixed(2)}B` : 
-            (data.info?.pe ? `P/E: ${data.info.pe}` : '-');
-        
-        renderChart(data);
-        
-    } catch (error) {
-        showToast('Ошибка загрузки графика', 'error');
-    }
-}
-
-function renderChart(data) {
-    const trace = {
-        x: data.dates,
-        open: data.open,
-        high: data.high,
-        low: data.low,
-        close: data.close,
-        type: 'candlestick',
-        name: data.ticker,
-        increasing: {line: {color: '#10b981'}},
-        decreasing: {line: {color: '#ef4444'}}
-    };
-    
-    const sma20 = {
-        x: data.dates,
-        y: data.sma20,
-        type: 'scatter',
-        mode: 'lines',
-        name: 'SMA20',
-        line: {color: '#6366f1', width: 1}
-    };
-    
-    const sma50 = {
-        x: data.dates,
-        y: data.sma50,
-        type: 'scatter',
-        mode: 'lines',
-        name: 'SMA50',
-        line: {color: '#f59e0b', width: 1}
-    };
-    
-    const layout = {
-        title: false,
-        xaxis: {title: 'Дата'},
-        yaxis: {title: 'Цена ($)'},
-        plot_bgcolor: '#f8fafc',
-        paper_bgcolor: '#f8fafc',
-        font: {family: '-apple-system, BlinkMacSystemFont, sans-serif'},
-        margin: {t: 10, r: 10, b: 40, l: 40},
-        showlegend: true,
-        legend: {orientation: 'h', y: -0.2}
-    };
-    
-    const config = {responsive: true, displayModeBar: false};
-    
-    Plotly.newPlot('chartContainer', [trace, sma20, sma50], layout, config);
-}
-
-function closeModal() {
-    document.getElementById('chartModal')?.classList.add('hidden');
-}
-
-function switchPage(page) {
-    document.querySelectorAll('.content-wrapper').forEach(p => p.classList.add('hidden'));
-    const targetPage = document.getElementById(page + 'Page');
-    if (targetPage) targetPage.classList.remove('hidden');
-    
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    document.querySelector(`[data-page="${page}"]`)?.classList.add('active');
-    
-    if (page === 'arbitrage') {
-        initArbitrageChart();
-    }
-}
-
-function showToast(message, type = 'info') {
-    const container = document.getElementById('toastContainer');
-    if (!container) return;
-    
-    const toast = document.createElement('div');
-    toast.className = `toast ${type}`;
-    
-    const icons = {
-        'success': 'fa-check-circle',
-        'error': 'fa-exclamation-circle',
-        'warning': 'fa-exclamation-triangle',
-        'info': 'fa-info-circle'
-    };
-    
-    toast.innerHTML = `<i class="fas ${icons[type] || icons.info}"></i><span>${message}</span>`;
-    container.appendChild(toast);
-    
-    setTimeout(() => {
-        toast.classList.add('fade-out');
-        setTimeout(() => toast.remove(), 300);
-    }, 3000);
-}
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// API функции
-async function updateMarketStatus() {
-    try {
-        const response = await fetch('/api/market-status');
-        const data = await response.json();
-        
-        const dot = document.getElementById('marketDot');
-        const text = document.getElementById('marketStatusText');
-        const time = document.getElementById('lastUpdate');
-        
-        if (dot && text) {
-            if (data.is_open) {
-                dot.className = 'dot open';
-                text.textContent = 'Рынок открыт';
-            } else {
-                dot.className = 'dot closed';
-                text.textContent = data.status_text || 'Закрыт';
-            }
-        }
-        
-        if (time) time.textContent = data.time;
-        
-    } catch (e) {
-        console.error('Market status error:', e);
-    }
-}
-
-async function updateEconomicCalendar() {
-    try {
-        const response = await fetch('/api/economic-calendar');
-        const data = await response.json();
-        
-        const banner = document.getElementById('econCalendarBanner');
-        const alertText = document.getElementById('econAlertText');
-        const list = document.getElementById('economicCalendarList');
-        const count = document.getElementById('econCount');
-        
-        if (data.events && data.events.length > 0) {
-            if (banner) banner.classList.remove('hidden');
-            if (alertText) alertText.textContent = `${data.events.length} важных событий на этой неделе`;
-            if (count) {
-                count.textContent = `${data.events.length} событий`;
-                count.classList.add('warning');
-            }
-            
-            if (list) {
-                list.innerHTML = data.events.map(e => `
-                    <div class="econ-item ${e.urgent ? 'urgent' : e.days_until <= 2 ? 'soon' : ''}">
-                        <div class="econ-symbol">${e.symbol}</div>
-                        <div class="econ-info">
-                            <div class="econ-title">${e.event}</div>
-                            <div class="econ-date">${e.date} ${e.time} (через ${e.days_until} дн.)</div>
-                        </div>
-                        <span class="econ-badge ${e.impact}">${e.impact}</span>
-                    </div>
-                `).join('');
-            }
-        } else {
-            if (banner) banner.classList.add('hidden');
-            if (count) count.textContent = '0 событий';
-        }
-        
-    } catch (e) {
-        console.error('Economic calendar error:', e);
-    }
-}
-
-async function loadMarketIndices() {
-    try {
-        const response = await fetch('/api/market-indices');
-        const data = await response.json();
-        
-        if (data.data) {
-            Object.entries(data.data).forEach(([symbol, info]) => {
-                const card = document.getElementById(symbol.toLowerCase());
-                if (card) {
-                    const valueEl = card.querySelector('.index-value');
-                    const changeEl = card.querySelector('.index-change');
+                    # Запускаем все скринеры
+                    log_message(f"🤖 Автозапуск #{autorun_state['run_count'] + 1} начинается...")
                     
-                    if (valueEl) valueEl.textContent = info.value.toFixed(2);
-                    if (changeEl) {
-                        changeEl.textContent = (info.positive ? '+' : '') + info.change + '%';
-                        changeEl.className = 'index-change ' + (info.positive ? 'positive' : 'negative');
-                    }
+                    tickers = autorun_state['tickers']
+                    screeners = autorun_state['screeners']
+                    total_signals = 0
+                    
+                    for screener_type in screeners:
+                        try:
+                            job_id = f"auto_{screener_type}_{now.strftime('%H%M%S')}"
+                            
+                            with lock:
+                                screening_state['queue'].append({
+                                    'id': job_id,
+                                    'type': screener_type,
+                                    'tickers': tickers.copy(),
+                                    'added_at': datetime.now().isoformat(),
+                                    'is_autorun': True
+                                })
+                            
+                            log_message(f"📥 Автозапуск: добавлен {screener_type}")
+                            
+                            # Ждем завершения этого скринера
+                            max_wait = 3600  # Максимум 1 час на скринер
+                            wait_start = time.time()
+                            
+                            while time.time() - wait_start < max_wait:
+                                with lock:
+                                    job_done = job_id in screening_state['results']
+                                    job_running = screening_state['current_job'] and screening_state['current_job']['id'] == job_id
+                                    
+                                    if job_done:
+                                        result = screening_state['results'][job_id]
+                                        signals = result.get('count', 0)
+                                        total_signals += signals
+                                        log_message(f"✅ Автозапуск {screener_type}: {signals} сигналов")
+                                        break
+                                    elif not job_running and job_id not in [j['id'] for j in screening_state['queue']]:
+                                        # Задача пропала из очереди без результата
+                                        log_message(f"⚠️ Автозапуск {screener_type}: задача не выполнена")
+                                        break
+                                
+                                time.sleep(1)
+                            
+                            # Небольшая пауза между скринерами
+                            time.sleep(3)
+                            
+                        except Exception as e:
+                            log_message(f"❌ Автозапуск {screener_type}: ошибка - {str(e)[:50]}")
+                            continue
+                    
+                    # Обновляем статистику
+                    with autorun_lock:
+                        autorun_state['last_run'] = now
+                        autorun_state['run_count'] += 1
+                        autorun_state['total_signals_found'] += total_signals
+                        autorun_state['next_run'] = now + timedelta(hours=autorun_state['interval_hours'])
+                    
+                    log_message(f"🎯 Автозапуск завершен! Всего сигналов: {total_signals}")
+                    log_message(f"⏰ Следующий запуск: {autorun_state['next_run'].strftime('%H:%M:%S')}")
+            
+            time.sleep(10)  # Проверяем каждые 10 секунд
+            
+        except Exception as e:
+            log_message(f"🔥 Ошибка автозапуска: {str(e)[:50]}")
+            time.sleep(30)
+
+# Запуск рабочих потоков
+load_arbitrage_history()
+save_worker = threading.Thread(target=auto_save_worker, daemon=True)
+save_worker.start()
+worker = threading.Thread(target=worker_thread, daemon=True)
+worker.start()
+autorun_worker_thread = threading.Thread(target=autorun_worker, daemon=True)
+autorun_worker_thread.start()
+
+# ========== API ROUTES ==========
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/market-status')
+def market_status():
+    """Статус рынка NYSE/NASDAQ"""
+    ny_time, offset = get_ny_time()
+    is_open = is_market_open()
+    status_text, color = get_next_market_open()
+    
+    # Определяем сессию
+    hour = ny_time.hour
+    if hour < 9 or (hour == 9 and ny_time.minute < 30):
+        session = 'Pre-market'
+    elif is_open:
+        session = 'Market'
+    else:
+        session = 'After-hours'
+    
+    return jsonify({
+        'is_open': is_open,
+        'status_text': status_text,
+        'color': color,
+        'time': ny_time.strftime('%H:%M'),
+        'market': 'NYSE/NASDAQ',
+        'session': session,
+        'timezone': f'GMT{offset:+d}' if offset < 0 else f'GMT+{offset}',
+        'your_local_time': datetime.now().strftime('%H:%M')
+    })
+
+@app.route('/api/economic-calendar')
+def economic_calendar():
+    """Ближайшие экономические события для панели"""
+    events = check_upcoming_events()
+    return jsonify({
+        'events': events,
+        'now': datetime.now().isoformat()
+    })
+
+@app.route('/api/economic-ticker')
+def economic_ticker():
+    """Данные для бегущей строки экономических событий"""
+    events = get_economic_events_for_ticker()
+    settings = ECONOMIC_ALERT_SETTINGS
+    
+    # Проверяем есть ли критические события (сегодня или завтра)
+    has_critical = any(e['alert_level'] in ['critical', 'warning'] for e in events)
+    
+    # Считаем события по уровням
+    critical_count = sum(1 for e in events if e['alert_level'] == 'critical')
+    warning_count = sum(1 for e in events if e['alert_level'] == 'warning')
+    info_count = sum(1 for e in events if e['alert_level'] == 'info')
+    
+    return jsonify({
+        'events': events,
+        'has_critical': has_critical,
+        'now': datetime.now().isoformat(),
+        'next_event': events[0] if events else None,
+        'settings': settings,
+        'counts': {
+            'critical': critical_count,
+            'warning': warning_count,
+            'info': info_count,
+            'total': len(events)
+        }
+    })
+
+@app.route('/api/economic-events')
+def get_all_economic_events():
+    """Получить все экономические события с фильтрацией"""
+    event_type = request.args.get('type', 'all')
+    impact = request.args.get('impact', 'all')
+    days = request.args.get('days', 30, type=int)
+    
+    now = datetime.now()
+    filtered_events = []
+    
+    for event in ECONOMIC_CALENDAR:
+        event_date = datetime.strptime(event['date'], '%Y-%m-%d')
+        days_until = (event_date - now).days
+        
+        # Фильтр по дням
+        if days_until < -1 or days_until > days:
+            continue
+        
+        # Фильтр по типу
+        if event_type != 'all' and event['type'] != event_type:
+            continue
+        
+        # Фильтр по влиянию
+        if impact != 'all' and event['impact'] != impact:
+            continue
+        
+        filtered_events.append({
+            **event,
+            'days_until': days_until,
+            'is_past': days_until < 0
+        })
+    
+    # Группировка по типам
+    events_by_type = {}
+    for event in filtered_events:
+        event_type_key = event['type']
+        if event_type_key not in events_by_type:
+            events_by_type[event_type_key] = []
+        events_by_type[event_type_key].append(event)
+    
+    return jsonify({
+        'events': sorted(filtered_events, key=lambda x: x['days_until']),
+        'events_by_type': events_by_type,
+        'counts': {
+            'total': len(filtered_events),
+            'by_type': {k: len(v) for k, v in events_by_type.items()}
+        },
+        'settings': ECONOMIC_ALERT_SETTINGS,
+        'event_types': list(set(e['type'] for e in ECONOMIC_CALENDAR)),
+        'impact_levels': ['high', 'medium', 'low']
+    })
+
+@app.route('/api/market-indices')
+def market_indices():
+    try:
+        indices = {
+            'SPX': yf.Ticker('^GSPC').history(period='1d'),
+            'NDX': yf.Ticker('^IXIC').history(period='1d'),
+            'DJI': yf.Ticker('^DJI').history(period='1d'),
+            'RUT': yf.Ticker('^RUT').history(period='1d'),
+            'VIX': yf.Ticker('^VIX').history(period='1d')
+        }
+        
+        result = {'timestamp': datetime.now().isoformat(), 'data': {}}
+        
+        for name, data in indices.items():
+            if not data.empty and data['Open'].iloc[-1] != 0:
+                close_val = float(data['Close'].iloc[-1])
+                open_val = float(data['Open'].iloc[-1])
+                change = ((close_val - open_val) / open_val) * 100
+                last_update = data.index[-1].strftime('%H:%M') if hasattr(data.index[-1], 'strftime') else '--:--'
+                
+                result['data'][name] = {
+                    'value': round(close_val, 2),
+                    'change': round(change, 2),
+                    'positive': bool(change >= 0),
+                    'last_update': last_update
                 }
-            });
+            else:
+                result['data'][name] = {'value': 0, 'change': 0, 'positive': False, 'last_update': '--:--'}
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/arbitrage')
+def arbitrage_data():
+    global arbitrage_history, last_arbitrage_update
+    
+    try:
+        data = arb_monitor.get_current_basis()
+        current_time = datetime.now()
+        
+        if data.get('error') or data.get('basis_pct') == 0:
+            return jsonify({
+                'error': 'No data from Yahoo Finance',
+                'connected': False,
+                'timestamp': current_time.isoformat(),
+                'time': current_time.strftime('%H:%M:%S'),
+                'history': arbitrage_history[-100:] if arbitrage_history else []
+            })
+        
+        data['timestamp'] = current_time.isoformat()
+        data['time'] = current_time.strftime('%H:%M:%S')
+        data['date'] = current_time.strftime('%Y-%m-%d')
+        data['connected'] = True
+        
+        with history_lock:
+            arbitrage_history.append({
+                'time': current_time.strftime('%H:%M'),
+                'date': current_time.strftime('%Y-%m-%d'),
+                'datetime': current_time.strftime('%Y-%m-%d %H:%M'),
+                'basis': data['basis_pct'],
+                'z_score': data.get('z_score', 0),
+                'vix': data.get('vix', 0),
+                'es_price': data.get('es_price', 0),
+                'spx_price': data.get('spx_price', 0),
+                'signal': data.get('signal', 'NEUTRAL'),
+                'timestamp': current_time.isoformat()
+            })
+            
+            if len(arbitrage_history) > 500000:
+                arbitrage_history = arbitrage_history[-450000:]
+            
+            last_arbitrage_update = current_time
+        
+        now = datetime.now()
+        periods = {
+            '1d': [x for x in arbitrage_history if datetime.fromisoformat(x['timestamp']) > now - timedelta(days=1)],
+            '7d': [x for x in arbitrage_history if datetime.fromisoformat(x['timestamp']) > now - timedelta(days=7)],
+            '30d': [x for x in arbitrage_history if datetime.fromisoformat(x['timestamp']) > now - timedelta(days=30)],
+            '90d': [x for x in arbitrage_history if datetime.fromisoformat(x['timestamp']) > now - timedelta(days=90)],
+            'all': arbitrage_history
         }
-    } catch (e) {
-        console.error('Indices error:', e);
-    }
-}
+        
+        stats = {}
+        if arbitrage_history:
+            recent = [x['basis'] for x in arbitrage_history[-1000:]]
+            stats = {
+                'total_points': len(arbitrage_history),
+                'first_date': arbitrage_history[0]['date'] if arbitrage_history else None,
+                'last_date': arbitrage_history[-1]['date'] if arbitrage_history else None,
+                'avg_basis': round(np.mean(recent), 4) if recent else 0,
+                'max_basis': round(max(recent), 4) if recent else 0,
+                'min_basis': round(min(recent), 4) if recent else 0,
+            }
+        
+        data['periods'] = periods
+        data['stats'] = stats
+        data['history'] = arbitrage_history[-100:]
+        
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'connected': False,
+            'timestamp': datetime.now().isoformat(),
+            'history': arbitrage_history[-100:] if arbitrage_history else []
+        }), 500
 
-function exportResults() {
-    const rows = document.querySelectorAll('#resultsTableBody tr');
-    if (rows.length === 0 || rows[0].classList.contains('empty-row')) {
-        showToast('Нет данных для экспорта', 'warning');
-        return;
-    }
-    
-    let csv = 'Тикер,Сигнал,Цена,Скор\n';
-    rows.forEach(row => {
-        const cells = row.querySelectorAll('td');
-        if (cells.length >= 4) {
-            const ticker = cells[0].textContent.trim();
-            const signal = cells[1].textContent.trim();
-            const price = cells[2].textContent.trim().replace('$', '');
-            const score = cells[3].textContent.trim();
-            csv += `${ticker},${signal},${price},${score}\n`;
+@app.route('/api/arbitrage/save', methods=['POST'])
+def force_save_arbitrage():
+    success = save_arbitrage_history()
+    return jsonify({
+        'success': success,
+        'points_saved': len(arbitrage_history),
+        'file': HISTORY_FILE
+    })
+
+@app.route('/api/chart-data/<ticker>')
+def chart_data(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="6mo")
+        
+        if hist.empty:
+            return jsonify({'error': 'No data'}), 404
+        
+        data = {
+            'ticker': ticker,
+            'dates': hist.index.strftime('%Y-%m-%d').tolist(),
+            'open': hist['Open'].tolist(),
+            'high': hist['High'].tolist(),
+            'low': hist['Low'].tolist(),
+            'close': hist['Close'].tolist(),
+            'volume': hist['Volume'].tolist(),
+            'sma20': hist['Close'].rolling(20).mean().fillna(0).tolist(),
+            'sma50': hist['Close'].rolling(50).mean().fillna(0).tolist()
         }
-    });
-    
-    const blob = new Blob([csv], {type: 'text/csv;charset=utf-8;'});
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `tradescreener_results_${new Date().toISOString().slice(0,10)}.csv`;
-    link.click();
-    
-    showToast('CSV файл скачан', 'success');
-}
+        
+        info = stock.info
+        data['info'] = {
+            'name': info.get('longName', ticker),
+            'sector': info.get('sector', '-'),
+            'marketCap': info.get('marketCap', 0),
+            'pe': info.get('trailingPE', None),
+            'dividend': info.get('dividendYield', None)
+        }
+        
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-function clearResults() {
-    document.getElementById('resultsTableBody').innerHTML = `
-        <tr class="empty-row">
-            <td colspan="6">
-                <div class="empty-state">
-                    <i class="fas fa-inbox"></i>
-                    <p>Нет активных сигналов. Запустите скринер.</p>
-                </div>
-            </td>
-        </tr>
-    `;
+@app.route('/api/queue/add', methods=['POST'])
+def add_to_queue():
+    data = request.json
+    screener_type = data.get('type', 'long')
+    tickers = data.get('tickers', [])
     
-    ['long', 'squeeze', 'oversold'].forEach(type => {
-        updateBadge(type, 0);
-        const grid = document.getElementById(type + 'Results');
-        if (grid) grid.innerHTML = '';
-    });
+    if not tickers:
+        return jsonify({'error': 'No tickers provided'}), 400
     
-    showToast('Результаты очищены', 'info');
-}
+    if len(tickers) > 1000:
+        return jsonify({'error': 'Max 1000 tickers allowed'}), 400
+    
+    job_id = f"{screener_type}_{datetime.now().strftime('%H%M%S')}_{len(tickers)}"
+    
+    with lock:
+        screening_state['queue'].append({
+            'id': job_id,
+            'type': screener_type,
+            'tickers': tickers,
+            'added_at': datetime.now().isoformat()
+        })
+        queue_pos = len(screening_state['queue'])
+    
+    log_message(f"📥 Добавлено: {job_id} ({len(tickers)} тикеров)")
+    
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'queue_position': queue_pos,
+        'estimated_minutes': round(len(tickers) * 0.5 / 60, 1),
+        'message': f'Added {len(tickers)} tickers'
+    })
 
-// Арбитраж
-let arbitrageChart = null;
-let currentPeriod = '1d';
+@app.route('/api/queue/status')
+def queue_status():
+    with lock:
+        # Получаем список задач в очереди
+        queue_preview = []
+        for job in screening_state['queue'][:5]:  # Первые 5 задач
+            queue_preview.append({
+                'id': job['id'],
+                'type': job['type'],
+                'tickers_count': len(job['tickers'])
+            })
+        
+        return jsonify({
+            'running': screening_state['running'],
+            'current_job': screening_state['current_job'],
+            'progress': screening_state['progress'],
+            'queue_length': len(screening_state['queue']),
+            'queue_preview': queue_preview,
+            'logs': screening_state['logs'][:20]
+        })
 
-async function initArbitrageChart() {
-    // Загрузка данных арбитража
-}
+@app.route('/api/queue/results/<job_id>')
+def get_results(job_id):
+    with lock:
+        if job_id in screening_state['results']:
+            return jsonify(screening_state['results'][job_id])
+        # Проверяем, является ли эта задача текущей
+        if screening_state['current_job'] and screening_state['current_job']['id'] == job_id:
+            return jsonify({'status': 'running', 'progress': screening_state['progress']}), 202
+        # Проверяем, есть ли задача в очереди
+        for job in screening_state['queue']:
+            if job['id'] == job_id:
+                position = screening_state['queue'].index(job) + 1
+                return jsonify({'status': 'queued', 'queue_position': position}), 202
+        return jsonify({'error': 'Job not found'}), 404
 
-// Делаем функции глобальными для onclick в HTML
-window.openChartModal = openChartModal;
+@app.route('/api/queue/clear', methods=['POST'])
+def clear_queue():
+    with lock:
+        screening_state['queue'] = []
+    log_message("🧹 Очередь очищена")
+    return jsonify({'success': True})
+
+# ========== АВТОЗАПУСК API ==========
+
+@app.route('/api/autorun/status')
+def autorun_status():
+    """Получить статус автозапуска"""
+    with autorun_lock:
+        status = autorun_state.copy()
+        # Конвертируем datetime в строки для JSON
+        if status['last_run']:
+            status['last_run'] = status['last_run'].isoformat()
+        if status['next_run']:
+            status['next_run'] = status['next_run'].isoformat()
+        
+        # Добавляем оставшееся время
+        if status['next_run'] and status['enabled']:
+            next_run = datetime.fromisoformat(status['next_run'])
+            remaining = next_run - datetime.now()
+            status['time_remaining'] = {
+                'hours': remaining.seconds // 3600,
+                'minutes': (remaining.seconds % 3600) // 60,
+                'seconds': remaining.seconds % 60,
+                'total_seconds': int(remaining.total_seconds())
+            }
+        else:
+            status['time_remaining'] = None
+        
+        return jsonify(status)
+
+@app.route('/api/autorun/start', methods=['POST'])
+def autorun_start():
+    """Запустить автозапуск"""
+    global autorun_state
+    data = request.json
+    
+    tickers = data.get('tickers', [])
+    interval_hours = data.get('interval_hours', 1)
+    screeners = data.get('screeners', ['long', 'squeeze', 'oversold'])
+    
+    if not tickers:
+        return jsonify({'error': 'No tickers provided'}), 400
+    
+    if interval_hours not in [1, 2, 3, 4, 5, 6, 12, 24]:
+        return jsonify({'error': 'Invalid interval. Allowed: 1, 2, 3, 4, 5, 6, 12, 24 hours'}), 400
+    
+    with autorun_lock:
+        autorun_state['enabled'] = True
+        autorun_state['tickers'] = tickers
+        autorun_state['interval_hours'] = interval_hours
+        autorun_state['screeners'] = screeners
+        autorun_state['next_run'] = datetime.now() + timedelta(hours=interval_hours)
+    
+    log_message(f"🤖 Автозапуск ВКЛЮЧЕН: каждые {interval_hours}ч, {len(tickers)} тикеров, {len(screeners)} скринеров")
+    
+    return jsonify({
+        'success': True,
+        'message': f'Autorun enabled with {interval_hours}h interval',
+        'next_run': autorun_state['next_run'].isoformat()
+    })
+
+@app.route('/api/autorun/stop', methods=['POST'])
+def autorun_stop():
+    """Остановить автозапуск"""
+    global autorun_state
+    
+    with autorun_lock:
+        was_enabled = autorun_state['enabled']
+        autorun_state['enabled'] = False
+        autorun_state['next_run'] = None
+    
+    if was_enabled:
+        log_message("🛑 Автозапуск ОСТАНОВЛЕН")
+    
+    return jsonify({
+        'success': True,
+        'message': 'Autorun stopped',
+        'stats': {
+            'total_runs': autorun_state['run_count'],
+            'total_signals': autorun_state['total_signals_found']
+        }
+    })
+
+@app.route('/api/autorun/run-now', methods=['POST'])
+def autorun_run_now():
+    """Запустить немедленно (вне расписания)"""
+    global autorun_state
+    data = request.json or {}
+    
+    tickers = data.get('tickers', autorun_state['tickers'])
+    screeners = data.get('screeners', autorun_state['screeners'])
+    
+    if not tickers:
+        return jsonify({'error': 'No tickers provided'}), 400
+    
+    # Добавляем все скринеры в очередь
+    job_ids = []
+    now = datetime.now()
+    
+    for screener_type in screeners:
+        job_id = f"manual_{screener_type}_{now.strftime('%H%M%S')}"
+        with lock:
+            screening_state['queue'].append({
+                'id': job_id,
+                'type': screener_type,
+                'tickers': tickers.copy(),
+                'added_at': now.isoformat(),
+                'is_manual': True
+            })
+        job_ids.append(job_id)
+    
+    log_message(f"⚡ Ручной запуск: {len(screeners)} скринеров добавлены в очередь")
+    
+    return jsonify({
+        'success': True,
+        'message': f'{len(screeners)} screeners queued',
+        'job_ids': job_ids
+    })
+
+# Health check endpoint для Render
+@app.route("/health")
+def health_check():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat(), "version": "1.0.0"})
+
+@app.route("/api/autorun/history")
+def autorun_history():
+    """Получить историю автозапуска (из результатов)"""
+    auto_results = []
+    
+    with lock:
+        for job_id, result in screening_state['results'].items():
+            if job_id.startswith('auto_') or job_id.startswith('manual_'):
+                auto_results.append({
+                    'job_id': job_id,
+                    'type': result.get('type'),
+                    'completed_at': result.get('completed_at'),
+                    'count': result.get('count', 0),
+                    'elapsed_seconds': result.get('elapsed_seconds', 0),
+                    'saved_file': result.get('saved_file')
+                })
+    
+    # Сортируем по времени (новые первые)
+    auto_results.sort(key=lambda x: x['completed_at'] or '', reverse=True)
+    
+    return jsonify({
+        'history': auto_results[:50],  # Последние 50 запусков
+        'total': len(auto_results)
+    })
+
+if __name__ == '__main__':
+    print(f"🚀 TradeScreener Pro запущен")
+    print(f"📁 Результаты сохраняются в: {os.path.abspath('results')}")
+    print(f"📊 История арбитража: {os.path.abspath(HISTORY_FILE)}")
+    app.run(debug=True, host='0.0.0.0', port=PORT, threaded=True)
