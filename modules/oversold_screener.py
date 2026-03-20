@@ -1,6 +1,6 @@
 """
-SqueezeScreener - Скринер для поиска Short Squeeze сетапов
-Улучшенная версия с анализом уровней, пробоев и ретестов
+OversoldScreener - Скринер для поиска перепроданных акций с потенциалом отскока
+Улучшенная версия с фундаментальным анализом
 """
 
 import yfinance as yf
@@ -11,266 +11,426 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-class SqueezeScreener:
+class OversoldScreener:
     def __init__(self):
-        self.min_price = 3.0
-        self.max_price = 100.0
-        self.min_volume = 500000
-        self.max_market_cap = 15e9
-        self.min_adx = 20
-        self.min_price_change_3d = 2
-        self.max_price_change_3d = 30
+        self.min_price = 2.0
+        self.min_cap = 300_000_000
+        self.min_volume = 400_000
         
-        # Веса для скора
-        self.score_trend_strength = 25
-        self.score_momentum = 20
-        self.score_rvol = 15
-        self.score_technical = 15
-        self.score_risk_reward = 15
-        self.score_volatility = 10
-        self.score_level_bounce = 25
-        self.score_level_breakout = 30
-        self.score_level_retest = 20
+        # Пороги для отскока
+        self.min_drop_5d = 7.0
+        self.min_drop_1d = 3.0
+        self.max_rsi = 35
+        self.min_bounce_target = 7.0
         
-    def safe_float(self, value, default=0.0):
+        # Фундаментальные пороги
+        self.max_pe = 30
+        self.max_peg = 2.0
+        self.min_roe = 0.08
+        self.max_debt_equity = 1.0
+        
+        # Веса
+        self.weight_technical = 60
+        self.weight_fundamental = 40
+        
+    def safe_float(self, value, default=0):
         try:
             if value is None:
                 return default
             if isinstance(value, (int, float)):
                 return float(value)
             if isinstance(value, str):
-                return float(value.replace(',', '').replace('%', ''))
+                return float(value.replace(',', ''))
             return default
         except:
             return default
     
-    def find_key_levels(self, df, lookback=90):
-        """Поиск сильных уровней"""
-        close = df['Close']
-        high = df['High']
-        low = df['Low']
-        volume = df['Volume']
-        
-        hist = df.tail(lookback)
-        
-        # Свинг-хаи и свинг-лои
-        swing_highs = []
-        swing_lows = []
-        window = 10
-        
-        for i in range(window, len(hist) - window):
-            if hist['High'].iloc[i] == max(hist['High'].iloc[i-window:i+window+1]):
-                swing_highs.append({
-                    'price': hist['High'].iloc[i],
-                    'strength': 1 + (hist['Volume'].iloc[i] / hist['Volume'].mean())
-                })
-            
-            if hist['Low'].iloc[i] == min(hist['Low'].iloc[i-window:i+window+1]):
-                swing_lows.append({
-                    'price': hist['Low'].iloc[i],
-                    'strength': 1 + (hist['Volume'].iloc[i] / hist['Volume'].mean())
-                })
-        
-        # Области высокого объема
-        price_bins = {}
-        bin_size = (hist['High'].max() - hist['Low'].min()) / 50
-        
-        for i in range(len(hist)):
-            price = (hist['High'].iloc[i] + hist['Low'].iloc[i]) / 2
-            vol = hist['Volume'].iloc[i]
-            bin_idx = int((price - hist['Low'].min()) / bin_size) if bin_size > 0 else 0
-            
-            if bin_idx not in price_bins:
-                price_bins[bin_idx] = {'volume': 0, 'price_level': price}
-            price_bins[bin_idx]['volume'] += vol
-        
-        high_volume_levels = []
-        if price_bins:
-            sorted_bins = sorted(price_bins.values(), key=lambda x: x['volume'], reverse=True)[:5]
-            high_volume_levels = [b['price_level'] for b in sorted_bins]
-        
-        return {
-            'swing_highs': swing_highs,
-            'swing_lows': swing_lows,
-            'high_volume_levels': high_volume_levels
-        }
+    def calculate_ema(self, prices, span):
+        return prices.ewm(span=span, adjust=False).mean()
     
-    def check_level_interaction(self, df, levels):
-        """Проверка взаимодействия цены с уровнями"""
-        current_price = df['Close'].iloc[-1]
-        prev_close = df['Close'].iloc[-2]
-        today_open = df['Open'].iloc[-1]
-        today_low = df['Low'].iloc[-1]
-        today_high = df['High'].iloc[-1]
-        volume = df['Volume'].iloc[-1]
-        avg_volume = df['Volume'].tail(20).mean()
+    def calculate_rsi(self, prices, period=14):
+        """Исправленная версия RSI"""
+        delta = prices.diff()
+        gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         
-        results = {
-            'support_bounce': False,
-            'resistance_break': False,
-            'retest': False,
-            'level_type': None,
-            'level_price': None,
-            'description': '',
-            'strength': 0
-        }
+        loss = loss.replace(0, np.nan)
+        rs = gain / loss
+        rs = rs.fillna(100)
         
-        # Проверка поддержки (отбой)
-        for swing_low in levels['swing_lows']:
-            level_price = swing_low['price']
-            distance = abs(current_price - level_price) / level_price * 100
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    def find_support_resistance(self, df, window=5):
+        """Поиск уровней поддержки/сопротивления"""
+        if len(df) < 20:
+            return []
+        
+        levels = []
+        for i in range(window, len(df) - window):
+            if df['Low'].iloc[i] == df['Low'].iloc[i-window:i+window+1].min():
+                levels.append({'price': df['Low'].iloc[i], 'type': 'support', 'date': df.index[i]})
+        
+        for i in range(window, len(df) - window):
+            if df['High'].iloc[i] == df['High'].iloc[i-window:i+window+1].max():
+                levels.append({'price': df['High'].iloc[i], 'type': 'resistance', 'date': df.index[i]})
+        
+        grouped_levels = []
+        for level in levels:
+            found = False
+            for gl in grouped_levels:
+                if abs(gl['price'] - level['price']) / gl['price'] < 0.015:
+                    gl['touches'] += 1
+                    gl['dates'].append(level['date'])
+                    found = True
+                    break
+            if not found:
+                grouped_levels.append({'price': level['price'], 'type': level['type'], 'touches': 1, 'dates': [level['date']]})
+        
+        strong_levels = [l for l in grouped_levels if l['touches'] >= 2]
+        strong_levels.sort(key=lambda x: x['touches'], reverse=True)
+        return strong_levels[:3]
+    
+    def check_bullish_divergence(self, df):
+        """Проверка бычьей дивергенции"""
+        if len(df) < 20:
+            return {'has_divergence': False, 'strength': 0}
+        
+        closes = df['Close'].tail(20)
+        rsi = self.calculate_rsi(closes).tail(20)
+        
+        price_lows = []
+        rsi_lows = []
+        
+        for i in range(5, len(closes)-5):
+            if closes.iloc[i] == min(closes.iloc[i-5:i+6]):
+                price_lows.append({'idx': i, 'price': closes.iloc[i]})
+            if rsi.iloc[i] == min(rsi.iloc[i-5:i+6]) and not pd.isna(rsi.iloc[i]):
+                rsi_lows.append({'idx': i, 'rsi': rsi.iloc[i]})
+        
+        if len(price_lows) >= 2 and len(rsi_lows) >= 2:
+            p1, p2 = price_lows[-2], price_lows[-1]
+            r1, r2 = rsi_lows[-2], rsi_lows[-1]
             
-            if distance < 1.5 and today_low <= level_price * 1.01 and current_price > level_price:
-                was_below = prev_close < level_price or today_open < level_price
-                
-                results['support_bounce'] = True
-                results['level_type'] = 'Support'
-                results['level_price'] = level_price
-                results['retest'] = was_below
-                results['strength'] = swing_low['strength']
-                results['description'] = f"Отбой от поддержки ${level_price:.2f}"
-                
-                if was_below:
-                    results['description'] += " (ретест)"
-                
-                if volume > avg_volume * 1.5:
-                    results['strength'] += 1
-                    results['description'] += " с объемом"
-                
-                return results
+            if p2['price'] < p1['price'] and r2['rsi'] > r1['rsi']:
+                strength = min(100, int((r2['rsi'] - r1['rsi']) * 10))
+                return {
+                    'has_divergence': True,
+                    'strength': strength,
+                    'type': 'bullish',
+                    'description': f"Цена: {p2['price']:.2f} < {p1['price']:.2f}, RSI: {r2['rsi']:.1f} > {r1['rsi']:.1f}"
+                }
         
-        # Проверка сопротивления (пробой)
-        for swing_high in levels['swing_highs']:
-            level_price = swing_high['price']
-            distance = abs(current_price - level_price) / level_price * 100
-            
-            if distance < 2.0 and current_price > level_price and prev_close <= level_price:
-                results['resistance_break'] = True
-                results['level_type'] = 'Resistance'
-                results['level_price'] = level_price
-                results['retest'] = False
-                results['strength'] = swing_high['strength']
-                results['description'] = f"Пробой сопротивления ${level_price:.2f}"
-                
-                if volume > avg_volume * 1.5:
-                    results['strength'] += 1
-                    results['description'] += " с объемом"
-                
-                return results
-        
-        return results
+        return {'has_divergence': False, 'strength': 0}
     
-    def calculate_vwap(self, df):
-        """Расчет VWAP"""
-        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-        return (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+    def check_hammer_candle(self, df):
+        """Проверка паттерна 'молот'"""
+        if len(df) < 2:
+            return {'is_hammer': False}
+        
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        body = abs(last['Close'] - last['Open'])
+        lower_shadow = min(last['Open'], last['Close']) - last['Low']
+        upper_shadow = last['High'] - max(last['Open'], last['Close'])
+        
+        if body > 0 and lower_shadow > body * 2 and upper_shadow < body * 0.5:
+            if last['Close'] > last['Open']:
+                strength = min(100, int(lower_shadow / body * 20))
+                return {
+                    'is_hammer': True,
+                    'strength': strength,
+                    'type': 'bullish_hammer',
+                    'description': f"Тело: {body:.2f}, Тень: {lower_shadow:.2f}"
+                }
+        
+        return {'is_hammer': False}
     
-    def calculate_momentum_strength(self, df):
-        """Расчет силы моментума"""
-        close = df['Close']
-        volume = df['Volume']
+    def check_engulfing_pattern(self, df):
+        """Проверка паттерна 'бычье поглощение'"""
+        if len(df) < 2:
+            return {'is_engulfing': False}
         
-        sma_5 = close.rolling(5).mean()
-        sma_20 = close.rolling(20).mean()
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
         
-        trend_up = sma_5.iloc[-1] > sma_20.iloc[-1]
+        if prev['Close'] < prev['Open'] and last['Close'] > last['Open']:
+            if last['Open'] < prev['Close'] and last['Close'] > prev['Open']:
+                vol_ratio = last['Volume'] / prev['Volume'] if prev['Volume'] > 0 else 1
+                strength = min(100, int(vol_ratio * 50))
+                
+                return {
+                    'is_engulfing': True,
+                    'strength': strength,
+                    'type': 'bullish_engulfing',
+                    'description': f"Объем: {vol_ratio:.1f}x"
+                }
         
-        price_change_3d = (close.iloc[-1] - close.iloc[-4]) / close.iloc[-4] * 100 if len(close) > 4 else 0
-        volume_trend = volume.tail(3).mean() > volume.tail(10).mean() * 1.2 if len(volume) > 10 else False
-        
-        # ADX
-        high, low = df['High'], df['Low']
-        
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean()
-        
-        up_move = high - high.shift()
-        down_move = low.shift() - low
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-        
-        atr_period = 14
-        plus_di = 100 * (pd.Series(plus_dm).rolling(atr_period).mean() / atr)
-        minus_di = 100 * (pd.Series(minus_dm).rolling(atr_period).mean() / atr)
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-        adx = dx.rolling(atr_period).mean()
-        
-        adx_value = adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0
-        
-        return {
-            'trend_up': trend_up,
-            'price_change_3d': round(price_change_3d, 2),
-            'volume_trend': volume_trend,
-            'adx': round(adx_value, 2),
-            'trend_strength': 'Strong' if adx_value > 25 else 'Weak' if adx_value < 20 else 'Moderate'
-        }
+        return {'is_engulfing': False}
     
-    def calculate_support_resistance(self, df):
-        """Расчет уровней поддержки/сопротивления"""
-        close = df['Close']
-        high = df['High']
-        low = df['Low']
+    def calculate_bounce_potential(self, df, current_price):
+        """Расчет потенциала отскока"""
+        if len(df) < 20:
+            return {'target_price': None, 'potential_%': 0, 'confidence': 0}
         
-        window = 5
+        highs = df['High'].tail(50)
         resistance_levels = []
-        support_levels = []
         
-        for i in range(window, len(high) - window):
-            if high.iloc[i] == max(high.iloc[i-window:i+window+1]):
-                resistance_levels.append(high.iloc[i])
-            if low.iloc[i] == min(low.iloc[i-window:i+window+1]):
-                support_levels.append(low.iloc[i])
+        for i in range(5, len(highs)-5):
+            if highs.iloc[i] == max(highs.iloc[i-5:i+6]):
+                if highs.iloc[i] > current_price:
+                    resistance_levels.append(highs.iloc[i])
         
-        current_price = close.iloc[-1]
-        nearest_resistance = min([r for r in resistance_levels if r > current_price], default=current_price * 1.05)
-        nearest_support = max([s for s in support_levels if s < current_price], default=current_price * 0.95)
+        if resistance_levels:
+            nearest_resistance = min(resistance_levels)
+        else:
+            ema50 = self.calculate_ema(df['Close'], 50).iloc[-1]
+            nearest_resistance = max(ema50, current_price * 1.05)
+        
+        potential = (nearest_resistance - current_price) / current_price * 100
+        
+        confidence = 0
+        atr = (df['High'] - df['Low']).tail(14).mean()
+        atr_pct = atr / current_price * 100
+        
+        if potential <= atr_pct * 2:
+            confidence = 80
+        elif potential <= atr_pct * 3:
+            confidence = 60
+        elif potential <= atr_pct * 4:
+            confidence = 40
+        else:
+            confidence = 20
         
         return {
-            'nearest_resistance': round(nearest_resistance, 2),
-            'nearest_support': round(nearest_support, 2),
-            'resistance_distance_%': round((nearest_resistance - current_price) / current_price * 100, 2),
-            'support_distance_%': round((current_price - nearest_support) / current_price * 100, 2),
-            'risk_reward_ratio': round((nearest_resistance - current_price) / (current_price - nearest_support), 2) if current_price > nearest_support else 0
+            'target_price': round(nearest_resistance, 2),
+            'potential_%': round(potential, 1),
+            'confidence': confidence,
+            'resistance_type': 'level' if resistance_levels else 'ema50'
         }
     
-    def identify_market_structure(self, df):
-        """Определение рыночной структуры"""
-        recent = df.tail(20)
+    def check_drop_recent(self, df):
+        """Проверка недавнего падения"""
+        if len(df) < 10:
+            return {'is_dropping': False, 'drop_5d': 0, 'drop_1d': 0}
         
-        higher_highs = 0
-        higher_lows = 0
-        lower_highs = 0
-        lower_lows = 0
+        current = df['Close'].iloc[-1]
+        close_5d_ago = df['Close'].iloc[-6] if len(df) >= 6 else current
+        close_1d_ago = df['Close'].iloc[-2]
         
-        for i in range(1, len(recent)):
-            if recent['High'].iloc[i] > recent['High'].iloc[i-1]:
-                higher_highs += 1
-            if recent['Low'].iloc[i] > recent['Low'].iloc[i-1]:
-                higher_lows += 1
-            if recent['High'].iloc[i] < recent['High'].iloc[i-1]:
-                lower_highs += 1
-            if recent['Low'].iloc[i] < recent['Low'].iloc[i-1]:
-                lower_lows += 1
-        
-        if higher_highs > lower_highs and higher_lows > lower_lows:
-            trend = "UPTREND"
-            structure = "HH/HL"
-        elif lower_highs > higher_highs and lower_lows > higher_lows:
-            trend = "DOWNTREND"
-            structure = "LH/LL"
-        else:
-            trend = "RANGING"
-            structure = "CHOP"
+        drop_5d = (close_5d_ago - current) / close_5d_ago * 100
+        drop_1d = (close_1d_ago - current) / close_1d_ago * 100
         
         return {
-            'trend': trend,
-            'structure': structure,
-            'hh_hl_ratio': higher_highs / max(higher_lows, 1),
-            'recent_strength': (higher_highs + higher_lows) - (lower_highs + lower_lows)
+            'drop_5d': round(drop_5d, 1),
+            'drop_1d': round(drop_1d, 1),
+            'is_dropping': drop_5d > 0,
+            'oversold_5d': drop_5d >= self.min_drop_5d,
+            'oversold_1d': drop_1d >= self.min_drop_1d
         }
+    
+    def calculate_fundamental_score(self, info, current_price):
+        """Расчет фундаментального скора"""
+        score = 0
+        details = {}
+        
+        # P/E
+        pe = info.get('trailingPE') or info.get('forwardPE')
+        pe = self.safe_float(pe, None)
+        if pe and 0 < pe < self.max_pe:
+            if pe < 15:
+                pe_score = 30
+                pe_grade = "Отлично"
+            elif pe < 25:
+                pe_score = 20
+                pe_grade = "Хорошо"
+            else:
+                pe_score = 10
+                pe_grade = "Приемлемо"
+            
+            score += pe_score
+            details['pe'] = round(pe, 2)
+            details['pe_score'] = pe_score
+            details['pe_grade'] = pe_grade
+        else:
+            details['pe'] = None
+            details['pe_score'] = 0
+        
+        # PEG
+        pe_for_peg = info.get('trailingPE')
+        growth = info.get('earningsGrowth') or info.get('revenueGrowth')
+        
+        if pe_for_peg and pe_for_peg > 0 and growth and growth > 0:
+            peg = pe_for_peg / (growth * 100)
+            if peg < 1.0:
+                peg_score = 25
+                peg_grade = "Недооценена"
+            elif peg < 1.5:
+                peg_score = 15
+                peg_grade = "Справедливо"
+            elif peg < self.max_peg:
+                peg_score = 5
+                peg_grade = "Дороговато"
+            else:
+                peg_score = 0
+                peg_grade = "Переоценена"
+            
+            score += peg_score
+            details['peg'] = round(peg, 2)
+            details['peg_score'] = peg_score
+            details['peg_grade'] = peg_grade
+        else:
+            details['peg'] = None
+            details['peg_score'] = 0
+        
+        # ROE
+        roe = info.get('returnOnEquity')
+        roe = self.safe_float(roe, 0)
+        if roe and roe > 0:
+            if roe > 0.25:
+                roe_score = 25
+                roe_grade = "Превосходно"
+            elif roe > 0.15:
+                roe_score = 20
+                roe_grade = "Отлично"
+            elif roe > self.min_roe:
+                roe_score = 15
+                roe_grade = "Хорошо"
+            else:
+                roe_score = 5
+                roe_grade = "Слабо"
+            
+            score += roe_score
+            details['roe'] = round(roe * 100, 1)
+            details['roe_score'] = roe_score
+            details['roe_grade'] = roe_grade
+        else:
+            details['roe'] = None
+            details['roe_score'] = 0
+        
+        # Debt/Equity
+        debt_to_equity = info.get('debtToEquity')
+        debt_to_equity = self.safe_float(debt_to_equity, None)
+        if debt_to_equity is not None:
+            de_ratio = debt_to_equity / 100
+            if de_ratio < 0.3:
+                de_score = 20
+                de_grade = "Очень низкий"
+            elif de_ratio < 0.6:
+                de_score = 15
+                de_grade = "Низкий"
+            elif de_ratio < self.max_debt_equity:
+                de_score = 10
+                de_grade = "Умеренный"
+            else:
+                de_score = 0
+                de_grade = "Высокий"
+            
+            score += de_score
+            details['debt_equity'] = round(de_ratio, 2)
+            details['de_score'] = de_score
+            details['de_grade'] = de_grade
+        else:
+            details['debt_equity'] = None
+            details['de_score'] = 0
+        
+        # Profit Margin
+        margin = info.get('profitMargins')
+        margin = self.safe_float(margin, 0)
+        if margin and margin > 0:
+            if margin > 0.20:
+                margin_score = 10
+            elif margin > 0.10:
+                margin_score = 5
+            else:
+                margin_score = 2
+            
+            score += margin_score
+            details['profit_margin'] = round(margin * 100, 1)
+            details['margin_score'] = margin_score
+        else:
+            details['profit_margin'] = None
+            details['margin_score'] = 0
+        
+        normalized_score = min(100, int(score * 100 / 110))
+        details['fundamental_score'] = normalized_score
+        details['fundamental_raw'] = score
+        
+        return normalized_score, details
+    
+    def calculate_risk_levels(self, hist, nearest_support, current_price):
+        """Расчет уровней риска"""
+        try:
+            atr = (hist['High'] - hist['Low']).tail(14).mean()
+            
+            if nearest_support and nearest_support['type'] == 'support':
+                stop_loss = nearest_support['price'] * 0.98
+                stop_type = "Поддержка"
+            else:
+                stop_loss = current_price - (1.5 * atr)
+                stop_type = "1.5xATR"
+            
+            risk_per_share = current_price - stop_loss
+            risk_pct = (risk_per_share / current_price) * 100 if current_price > 0 else 0
+            
+            return {
+                'stop_loss': round(stop_loss, 2),
+                'stop_type': stop_type,
+                'risk_per_share': round(risk_per_share, 2),
+                'risk_pct': round(risk_pct, 2)
+            }
+        except:
+            return {
+                'stop_loss': current_price * 0.95,
+                'stop_type': 'Default',
+                'risk_per_share': round(current_price * 0.05, 2),
+                'risk_pct': 5.0
+            }
+    
+    def check_earnings_risk(self, stock):
+        """Проверка риска отчетности"""
+        try:
+            calendar = stock.calendar
+            if calendar is not None and not calendar.empty:
+                next_earnings = pd.to_datetime(calendar.index[0])
+                days_to_earnings = (next_earnings - datetime.now()).days
+                if 0 <= days_to_earnings <= 3:
+                    return {'risk': 'HIGH', 'days': days_to_earnings, 'skip': True}
+                elif 4 <= days_to_earnings <= 7:
+                    return {'risk': 'MEDIUM', 'days': days_to_earnings, 'skip': False}
+            return {'risk': 'LOW', 'days': 999, 'skip': False}
+        except:
+            return {'risk': 'UNKNOWN', 'days': 999, 'skip': False}
+    
+    def analyze_volume(self, hist):
+        """Анализ объема"""
+        try:
+            current_vol = hist['Volume'].iloc[-1]
+            avg_vol_20 = hist['Volume'].tail(20).mean()
+            rel_volume = current_vol / avg_vol_20 if avg_vol_20 > 0 else 1.0
+            
+            selling_on_drop = False
+            if len(hist) > 5:
+                if hist['Close'].iloc[-5] > hist['Close'].iloc[-1]:
+                    max_vol_drop = hist['Volume'].tail(5).max()
+                    if max_vol_drop > avg_vol_20 * 1.5:
+                        selling_on_drop = True
+            
+            vol_score = 0
+            if rel_volume > 1.5:
+                vol_score += 15
+            if selling_on_drop:
+                vol_score += 10
+            
+            return {
+                'rel_volume': round(rel_volume, 2),
+                'vol_score': vol_score,
+                'selling_on_drop': selling_on_drop,
+                'is_accumulation': rel_volume > 1.2 and hist['Close'].iloc[-1] > hist['Close'].iloc[-2]
+            }
+        except:
+            return {'rel_volume': 1.0, 'vol_score': 0, 'selling_on_drop': False, 'is_accumulation': False}
     
     def analyze_ticker(self, ticker: str) -> Optional[Dict]:
         try:
@@ -278,222 +438,170 @@ class SqueezeScreener:
             hist = stock.history(period="90d")
             info = stock.info
             
-            if hist.empty or len(hist) < 30:
+            if hist.empty or len(hist) < 20:
                 return None
             
             current_price = hist['Close'].iloc[-1]
-            volume = hist['Volume'].iloc[-1]
-            market_cap = self.safe_float(info.get('marketCap', 0))
             
             # Базовые фильтры
-            if not (self.min_price <= current_price <= self.max_price):
+            if current_price < self.min_price:
                 return None
             
-            if market_cap > self.max_market_cap or market_cap == 0:
+            market_cap = info.get('marketCap', 0)
+            market_cap = self.safe_float(market_cap, 0)
+            if market_cap < self.min_cap:
                 return None
             
-            if volume < self.min_volume:
+            volume = info.get('averageVolume', 0)
+            volume = self.safe_float(volume, 0)
+            dollar_volume = volume * current_price
+            if dollar_volume < self.min_volume:
                 return None
             
-            # Моментум
-            momentum = self.calculate_momentum_strength(hist)
-            
-            if momentum['adx'] < self.min_adx and momentum['price_change_3d'] < self.min_price_change_3d:
+            # Проверка earnings
+            earnings = self.check_earnings_risk(stock)
+            if earnings.get('skip'):
                 return None
             
-            if momentum['price_change_3d'] > self.max_price_change_3d:
-                return None
+            # ===== ТЕХНИЧЕСКИЙ АНАЛИЗ =====
+            tech_score = 0
+            tech_details = {}
             
-            # Relative Volume
-            avg_vol = hist['Volume'].tail(20).mean()
-            rvol = volume / avg_vol if avg_vol > 0 else 1.0
+            # Падение
+            drop = self.check_drop_recent(hist)
+            tech_details.update(drop)
             
-            # Уровни
-            levels = self.find_key_levels(hist)
-            level_interaction = self.check_level_interaction(hist, levels)
+            if drop['oversold_5d']:
+                tech_score += 30
+            elif drop['drop_5d'] > 0:
+                tech_score += 10
             
-            # Рыночная структура
-            market_structure = self.identify_market_structure(hist)
+            if drop['oversold_1d']:
+                tech_score += 20
+            elif drop['drop_1d'] > 0:
+                tech_score += 5
             
-            # ATR
-            atr = (hist['High'] - hist['Low']).tail(14).mean()
-            atr_pct = (atr / current_price) * 100
+            # RSI
+            rsi = self.calculate_rsi(hist['Close']).iloc[-1]
+            tech_details['rsi'] = round(rsi, 1)
             
-            # VWAP
-            vwap = self.calculate_vwap(hist.tail(20)).iloc[-1]
-            above_vwap = current_price > vwap
+            if not pd.isna(rsi):
+                if rsi < 25:
+                    tech_score += 35
+                elif rsi < self.max_rsi:
+                    tech_score += 25
+                elif rsi < 45:
+                    tech_score += 10
             
-            # Уровни R/R
-            sr_levels = self.calculate_support_resistance(hist)
+            # Уровни поддержки
+            levels = self.find_support_resistance(hist)
+            nearest_support = None
             
-            # ===== РАСЧЕТ СКОРА =====
-            score = 0
-            signals = []
+            if levels:
+                supports = [l for l in levels if l['type'] == 'support' and l['price'] < current_price]
+                if supports:
+                    nearest_support = min(supports, key=lambda x: abs(x['price'] - current_price))
+                    dist_to_support = (current_price - nearest_support['price']) / current_price * 100
+                    
+                    tech_details['support_price'] = nearest_support['price']
+                    tech_details['support_touches'] = nearest_support['touches']
+                    tech_details['dist_to_support'] = round(dist_to_support, 1)
+                    
+                    if dist_to_support < 3.0 and nearest_support['touches'] >= 3:
+                        tech_score += 35
+                    elif dist_to_support < 5.0 and nearest_support['touches'] >= 2:
+                        tech_score += 25
+                    elif dist_to_support < 7.0:
+                        tech_score += 10
             
-            # RVOL
-            if rvol > 5:
-                score += self.score_rvol
-                signals.append(f"🔥 Экстремальный объем {rvol:.1f}x")
-            elif rvol > 3:
-                score += int(self.score_rvol * 0.8)
-                signals.append(f"📈 Высокий объем {rvol:.1f}x")
-            elif rvol > 2:
-                score += int(self.score_rvol * 0.5)
-                signals.append(f"📊 Объем выше среднего {rvol:.1f}x")
+            # Дивергенция
+            divergence = self.check_bullish_divergence(hist)
+            tech_details['has_divergence'] = divergence['has_divergence']
             
-            # Gap
-            today_open = hist['Open'].iloc[-1]
-            prev_close = hist['Close'].iloc[-2]
-            gap_pct = (today_open - prev_close) / prev_close * 100
+            if divergence['has_divergence']:
+                tech_score += divergence['strength']
             
-            if gap_pct > 10:
-                score += 15
-                signals.append(f"🚨 Gap up +{gap_pct:.1f}%")
-            elif gap_pct > 5:
-                score += 9
-                signals.append(f"⬆️ Gap up +{gap_pct:.1f}%")
+            # Паттерны
+            hammer = self.check_hammer_candle(hist)
+            engulfing = self.check_engulfing_pattern(hist)
             
-            # Пробой
-            if current_price > sr_levels['nearest_resistance'] * 0.99 and rvol > 1.5:
-                score += self.score_technical
-                signals.append(f"💥 Пробой уровня ${sr_levels['nearest_resistance']:.2f}")
+            if hammer['is_hammer']:
+                tech_score += hammer['strength']
             
-            # Сжатие волатильности
-            bb_width = (hist['High'].tail(10).max() - hist['Low'].tail(10).min()) / hist['Close'].tail(10).mean() * 100
-            if bb_width < 8 and rvol > 2:
-                score += 10
-                signals.append("🎯 Сжатие + пробой")
+            if engulfing['is_engulfing']:
+                tech_score += engulfing['strength']
             
-            # Моментум
-            closes = hist['Close'].tail(5)
-            returns = closes.pct_change().dropna()
+            # Потенциал отскока
+            bounce = self.calculate_bounce_potential(hist, current_price)
+            tech_details['target_price'] = bounce['target_price']
+            tech_details['potential_%'] = bounce['potential_%']
+            tech_details['bounce_confidence'] = bounce['confidence']
             
-            if len(returns) >= 3:
-                if all(r > 0 for r in returns.tail(3)) and returns.iloc[-1] > returns.iloc[-2]:
-                    score += self.score_momentum
-                    signals.append("🚀 Ускоряющийся рост")
-                
-                daily_change = (current_price - prev_close) / prev_close * 100
-                if daily_change > 10:
-                    score += 10
-                    signals.append(f"⚡ Сильный день +{daily_change:.1f}%")
-                elif daily_change > 5:
-                    score += 5
-                    signals.append(f"📈 Рост +{daily_change:.1f}%")
+            if bounce['potential_%'] >= self.min_bounce_target:
+                tech_score += min(30, int(bounce['confidence'] / 3))
             
-            # Market Cap
-            if market_cap > 0:
-                if market_cap < 500e6:
-                    score += 10
-                    cap_category = 'Micro'
-                    signals.append("🎲 Micro-cap")
-                elif market_cap < 2e9:
-                    score += 7
-                    cap_category = 'Small'
-                    signals.append("🎯 Small-cap")
-                else:
-                    cap_category = 'Mid+'
+            # Объем
+            vol = self.analyze_volume(hist)
+            tech_details['rel_volume'] = vol['rel_volume']
             
-            # Волатильность
-            if 3 < atr_pct < 12:
-                score += self.score_volatility
-            elif atr_pct > 15:
-                score -= 10
-                signals.append("⚠️ Слишком волатильно")
+            if vol['selling_on_drop']:
+                tech_score += vol['vol_score']
             
-            # VWAP
-            if above_vwap and rvol > 2:
-                signals.append(f"✅ Выше VWAP")
-                score += 5
+            # ===== ФУНДАМЕНТАЛЬНЫЙ АНАЛИЗ =====
+            fund_score, fund_details = self.calculate_fundamental_score(info, current_price)
             
-            # Уровни
-            if level_interaction['support_bounce']:
-                score += self.score_level_bounce
-                signals.append(f"🛡️ {level_interaction['description']}")
-                
-                if level_interaction['strength'] > 1.5:
-                    score += 10
-                    signals.append("💪 Сильный уровень")
-                
-                if level_interaction['retest']:
-                    score += self.score_level_retest
-                    signals.append("🔄 Ретест")
+            # ===== ИТОГОВАЯ ОЦЕНКА =====
+            total_score = int(tech_score * (self.weight_technical/100) + fund_score * (self.weight_fundamental/100))
             
-            if level_interaction['resistance_break']:
-                score += self.score_level_breakout
-                signals.append(f"🚀 {level_interaction['description']}")
-                
-                if level_interaction['strength'] > 1.5:
-                    score += 10
-                    signals.append("📊 Пробой с объемом")
-                
-                if level_interaction['retest']:
-                    score += self.score_level_retest
-                    signals.append("🎯 Ретест пробитого")
-            
-            # Рыночная структура
-            if market_structure['trend'] == 'UPTREND':
-                score += 10
-                signals.append(f"📈 {market_structure['structure']}")
-            elif market_structure['trend'] == 'DOWNTREND':
-                score -= 15
-                signals.append("📉 Нисходящая структура")
+            # Риск-менеджмент
+            risk = self.calculate_risk_levels(hist, nearest_support, current_price)
             
             # R/R
-            if sr_levels['risk_reward_ratio'] > 3:
-                score += self.score_risk_reward
-                signals.append(f"💰 R/R: {sr_levels['risk_reward_ratio']:.1f}")
-            elif sr_levels['risk_reward_ratio'] > 2:
-                score += int(self.score_risk_reward * 0.8)
-                signals.append(f"⚖️ R/R: {sr_levels['risk_reward_ratio']:.1f}")
+            potential = tech_details.get('potential_%', 0)
+            if risk['risk_pct'] > 0 and potential > 0:
+                rr_ratio = potential / risk['risk_pct']
+            else:
+                rr_ratio = 0
             
-            # ADX
-            if momentum['adx'] > 25:
-                score += self.score_trend_strength
-                signals.append(f"💪 ADX: {momentum['adx']:.1f}")
-            
-            # ===== ОПРЕДЕЛЕНИЕ ГРЕЙДА =====
-            if level_interaction.get('level_type') == 'Resistance (Retest)':
-                grade = "🔄 RETEST SETUP"
-            elif level_interaction.get('resistance_break') and not level_interaction.get('retest'):
-                grade = "🚀 BREAKOUT"
-            elif level_interaction.get('support_bounce'):
-                grade = "🛡️ SUPPORT BOUNCE"
-            elif score >= 80 and rvol > 3:
-                grade = "🚨 SQUEEZE ALERT"
-            elif score >= 60:
-                grade = "⚡ PRE-SQUEEZE"
-            elif score >= 40:
-                grade = "👀 EARLY SETUP"
-            elif score < 20 and rvol > 5:
-                grade = "☠️ HIGH RISK"
+            # Грейд
+            if total_score >= 85 and potential >= self.min_bounce_target and fund_score >= 70:
+                grade = "🚀 PERFECT FUNDAMENTAL BOUNCE"
+            elif total_score >= 75 and potential >= self.min_bounce_target and fund_score >= 60:
+                grade = "✅ STRONG FUNDAMENTAL BOUNCE"
+            elif total_score >= 70 and potential >= self.min_bounce_target:
+                grade = "📈 TECHNICAL BOUNCE"
+            elif total_score >= 65:
+                grade = "👀 WATCH"
+            elif total_score >= 50 and tech_details.get('drop_5d', 0) >= 5:
+                grade = "📉 OVERSOLD ONLY"
             else:
                 grade = "PASS"
-            
-            # Стоп-лосс
-            stop_loss = current_price * (1 - atr_pct/100 * 2)
-            target_price = sr_levels['nearest_resistance']
             
             return {
                 'ticker': ticker,
                 'grade': grade,
                 'price': round(current_price, 2),
-                'score': score,
-                'rvol': round(rvol, 1),
-                'change_3d': momentum['price_change_3d'],
-                'breakout': level_interaction.get('resistance_break', False),
-                'level_price': round(level_interaction.get('level_price'), 2) if level_interaction.get('level_price') else None,
-                'atr': round(atr_pct, 1),
-                'level_info': level_interaction.get('description', ''),
-                'market_trend': market_structure['trend'],
-                'adx': momentum['adx'],
-                'nearest_resistance': sr_levels['nearest_resistance'],
-                'nearest_support': sr_levels['nearest_support'],
-                'risk_reward': sr_levels['risk_reward_ratio'],
-                'stop_loss': round(stop_loss, 2),
-                'target_price': round(target_price, 2),
-                'potential': round((target_price - current_price) / current_price * 100, 1),
-                'signals': " | ".join(signals[:3])
+                'score': total_score,
+                'tech_score': tech_score,
+                'fund_score': fund_score,
+                'drop_5d': tech_details.get('drop_5d'),
+                'drop_1d': tech_details.get('drop_1d'),
+                'rsi': tech_details.get('rsi'),
+                'target_price': tech_details.get('target_price'),
+                'potential': tech_details.get('potential_%'),
+                'confidence': tech_details.get('bounce_confidence'),
+                'support_price': tech_details.get('support_price'),
+                'support_touches': tech_details.get('support_touches'),
+                'has_divergence': tech_details.get('has_divergence'),
+                'rel_volume': tech_details.get('rel_volume'),
+                'pe': fund_details.get('pe'),
+                'peg': fund_details.get('peg'),
+                'roe': fund_details.get('roe'),
+                'debt_equity': fund_details.get('debt_equity'),
+                'profit_margin': fund_details.get('profit_margin'),
+                'stop_loss': risk.get('stop_loss'),
+                'risk_pct': risk.get('risk_pct'),
+                'risk_reward': round(rr_ratio, 2)
             }
             
         except Exception as e:
