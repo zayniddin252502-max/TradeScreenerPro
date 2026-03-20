@@ -1,0 +1,26 @@
+# TradeScreener Pro - Переменные окружения
+# Скопируйте этот файл в .env и заполните свои значения
+
+# === Flask ===
+FLASK_ENV=production
+FLASK_DEBUG=False
+SECRET_KEY=your-secret-key-here-change-in-production
+
+# === Server ===
+PORT=5000
+HOST=0.0.0.0
+
+# === API Keys (опционально) ===
+# Если понадобятся в будущем для платных API
+# ALPHA_VANTAGE_API_KEY=your_key_here
+# FINNHUB_API_KEY=your_key_here
+# POLYGON_API_KEY=your_key_here
+
+# === Data Settings ===
+MAX_HISTORY_DAYS=730
+AUTO_SAVE_INTERVAL=300
+
+# === Screener Settings ===
+DEFAULT_MIN_PRICE=2.0
+DEFAULT_MAX_PRICE=500.0
+DEFAULT_MIN_VOLUME=400000

@@ -1,0 +1,235 @@
+# TradeScreener Pro
+
+Профессиональная платформа для скрининга акций с анализом рынка в реальном времени.
+
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![Flask](https://img.shields.io/badge/Flask-3.0-green)
+![Render](https://img.shields.io/badge/Deploy-Render-purple)
+
+## 🚀 Быстрый старт
+
+### Локальный запуск
+
+```bash
+# 1. Клонировать репозиторий
+git clone https://github.com/yourusername/tradescreener-pro.git
+cd tradescreener-pro
+
+# 2. Создать виртуальное окружение
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# или
+venv\Scripts\activate  # Windows
+
+# 3. Установить зависимости
+pip install -r requirements.txt
+
+# 4. Запустить приложение
+python app.py
+
+# 5. Открыть в браузере
+http://localhost:5000
+```
+
+### Деплой на Render (Бесплатно)
+
+#### Способ 1: Через Render Blueprint (рекомендуется)
+
+1. **Форкните этот репозиторий** на GitHub
+2. **Зарегистрируйтесь на [Render](https://render.com)**
+3. **Нажмите "New +" → "Blueprint"**
+4. **Подключите свой GitHub аккаунт**
+5. **Выберите репозиторий** `tradescreener-pro`
+6. **Нажмите "Apply"** - Render автоматически создаст сервис
+
+#### Способ 2: Вручную
+
+1. **Форкните репозиторий** на GitHub
+2. **Создайте Web Service на Render:**
+   - Нажмите "New +" → "Web Service"
+   - Подключите GitHub репозиторий
+   - Выберите ветку `main`
+3. **Настройте:**
+   - **Runtime:** Python 3
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `gunicorn app:app --bind 0.0.0.0:$PORT`
+   - **Plan:** Free (или Starter для лучшей производительности)
+4. **Добавьте Disk (для сохранения данных):**
+   - Name: `tradescreener-data`
+   - Mount Path: `/opt/render/project/src/data`
+   - Size: 1 GB
+5. **Нажмите "Create Web Service"**
+
+## 📊 Возможности
+
+### Скринеры
+- **Long Setups** - Поиск долгосрочных сетапов с фундаментальным анализом (P/E, ROE, Debt/Equity)
+- **Short Squeeze** - Анализ уровней, пробоев и ретестов для свинг-трейдинга
+- **Oversold Bounce** - Поиск перепроданных акций с потенциалом отскока
+
+### Автозапуск
+- **Периодический запуск** - Автоматический запуск скринеров каждые 1, 2, 3, 4, 5, 6, 12 или 24 часа
+- **Выбор скринеров** - Включайте/выключайте нужные скринеры
+- **Статистика** - Отслеживание количества запусков и найденных сигналов
+- **Ручной запуск** - Кнопка "Сейчас" для немедленного запуска вне расписания
+
+### Мониторинг
+- **Арбитраж ES/SPX** - Мониторинг базиса фьючерсов vs спот в реальном времени
+- **Экономический календарь** - Бегущая строка с датами FOMC, FED, NONFARM, CPI
+- **Индексы рынка** - S&P 500, Nasdaq, Dow Jones, Russell 2000, VIX
+
+## 📁 Структура проекта
+
+```
+tradescreener_pro/
+├── app.py                    # Главный Flask сервер + API
+├── requirements.txt          # Зависимости Python
+├── README.md                 # Документация
+├── render.yaml               # Конфигурация Render Blueprint
+├── Procfile                  # Команда запуска для Render
+├── runtime.txt               # Версия Python
+├── .env.example              # Пример переменных окружения
+├── .gitignore                # Исключения Git
+├── modules/                  # Модули скринеров
+│   ├── __init__.py
+│   ├── long_screener.py      # Long Setups скринер
+│   ├── squeeze_screener.py   # Short Squeeze скринер
+│   ├── oversold_screener.py  # Oversold Bounce скринер
+│   └── arbitrage.py          # Мониторинг арбитража ES/SPX
+├── templates/                # HTML шаблоны
+│   └── index.html
+├── static/                   # Статические файлы
+│   ├── css/
+│   │   └── style.css         # Стили + анимации
+│   └── js/
+│       └── app.js            # JavaScript логика
+├── results/                  # CSV результаты скрининга
+└── history/                  # JSON история арбитража
+```
+
+## 🔧 Переменные окружения
+
+Создайте файл `.env` на основе `.env.example`:
+
+```env
+# Flask
+FLASK_ENV=production
+FLASK_DEBUG=False
+SECRET_KEY=your-secret-key-here
+
+# Server
+PORT=5000
+HOST=0.0.0.0
+
+# Data
+MAX_HISTORY_DAYS=730
+AUTO_SAVE_INTERVAL=300
+```
+
+## 📅 Экономический календарь
+
+### Отслеживаемые события:
+
+| Тип | Событие | Влияние | Символ |
+|-----|---------|---------|--------|
+| **FOMC** | Заседания ФРС (решение по ставке) | 🔴 Высокое | 🏦 |
+| **FOMC-MINUTES** | Протоколы заседаний ФРС | 🔴 Высокое | 📋 |
+| **NFP** | Non-Farm Payrolls (занятость) | 🔴 Высокое | 💼 |
+| **CPI** | Consumer Price Index (инфляция) | 🔴 Высокое | 📈 |
+| **PPI** | Producer Price Index | 🔴 Высокое | 🏭 |
+| **GDP** | ВВП (квартальные данные) | 🔴 Высокое | 🇺🇸 |
+| **RETAIL** | Retail Sales (розничные продажи) | 🔴 Высокое | 🛒 |
+| **UNEMPLOYMENT** | Уровень безработицы | 🔴 Высокое | 📉 |
+| **FED** | Выступления Пауэлла | 🔴 Высокое | 🎤 |
+| **ISM** | ISM Manufacturing PMI | 🟡 Среднее | 🏭 |
+| **CONFIDENCE** | Consumer Confidence | 🟡 Среднее | 💰 |
+| **HOUSING** | Housing Starts (строительство) | 🟡 Среднее | 🏠 |
+| **INDUSTRIAL** | Industrial Production | 🟡 Среднее | ⚙️ |
+| **JOBLESS** | Initial Jobless Claims | 🟡 Среднее | 📋 |
+
+### Цветовая индикация:
+- **🔴 Красный** - Событие сегодня/завтра (критически важно!)
+- **🟠 Оранжевый** - Событие через 2-3 дня (внимание!)
+- **⚪ Темный** - Событие более чем через 3 дня
+
+## 🔌 API Endpoints
+
+### Основные
+- `GET /api/market-status` - Статус рынка (NYSE/NASDAQ)
+- `GET /api/market-indices` - Данные по индексам (SPX, NDX, DJI, RUT, VIX)
+- `GET /health` - Health check для мониторинга
+
+### Экономический календарь
+- `GET /api/economic-calendar` - Ближайшие события (14 дней)
+- `GET /api/economic-ticker` - Данные для бегущей строки (30 дней)
+- `GET /api/economic-events` - Все события с фильтрацией
+
+### Арбитраж
+- `GET /api/arbitrage` - Данные арбитража ES/SPX
+- `POST /api/arbitrage/save` - Сохранить историю
+
+### Очередь скрининга
+- `POST /api/queue/add` - Добавить задачу в очередь
+- `GET /api/queue/status` - Статус очереди
+- `GET /api/queue/results/<job_id>` - Результаты скрининга
+- `POST /api/queue/clear` - Очистить очередь
+
+### Автозапуск
+- `GET /api/autorun/status` - Статус автозапуска
+- `POST /api/autorun/start` - Запустить автозапуск
+- `POST /api/autorun/stop` - Остановить автозапуск
+- `POST /api/autorun/run-now` - Запустить немедленно
+- `GET /api/autorun/history` - История автозапуска
+
+### Графики
+- `GET /api/chart-data/<ticker>` - Данные для графика
+
+## 💡 Использование
+
+### Ручной запуск скрининга
+1. Введите список тикеров (через запятую) или загрузите S&P 500
+2. Выберите скринер и нажмите "Запустить"
+3. Дождитесь завершения анализа
+4. Просматривайте результаты в таблице или на отдельных страницах
+5. Нажмите на тикер для просмотра графика
+
+### Автозапуск
+1. Нажмите кнопку **"Автозапуск"** рядом с "Запустить всё"
+2. Выберите период: 1, 2, 3, 4, 5, 6, 12 или 24 часа
+3. Отметьте нужные скринеры (Long, Squeeze, Oversold)
+4. Нажмите **"Запустить"** - автозапуск активирован!
+5. Используйте **"Сейчас"** для немедленного запуска
+6. Нажмите **"Остановить"** для отключения автозапуска
+
+### Мониторинг арбитража
+1. Перейдите на вкладку **"Арбитраж ES/SPX"**
+2. Наблюдайте за базисом в реальном времени
+3. Используйте переключатель периодов (1d, 7d, 30d, 90d, all)
+4. Сигналы:
+   - **BULLISH (Premium)** - ES торгуется с премией к SPX
+   - **BEARISH (Discount)** - ES торгуется с дисконтом к SPX
+   - **NEUTRAL** - Базис в норме
+
+## 💾 Сохранение данных
+
+- Результаты скрининга сохраняются в папку `results/` в формате CSV
+- История арбитража сохраняется в `history/arbitrage_history.json`
+- Автосохранение каждые 5 минут
+
+## 🛠️ Требования
+
+- Python 3.8+
+- Интернет-соединение (данные от Yahoo Finance)
+- Современный браузер
+
+## 📝 Лицензия
+
+MIT License
+
+## 🤝 Поддержка
+
+Если у вас есть вопросы или предложения, создайте [Issue](https://github.com/yourusername/tradescreener-pro/issues) или [Pull Request](https://github.com/yourusername/tradescreener-pro/pulls).
+
+---
+
+**⚠️ Дисклеймер:** Этот инструмент предназначен только для информационных целей и не является финансовой рекомендацией. Всегда проводите собственный анализ перед принятием инвестиционных решений.

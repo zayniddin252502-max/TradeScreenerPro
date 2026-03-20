@@ -1,0 +1,23 @@
+# Render Blueprint для TradeScreener Pro
+# Этот файл автоматически настраивает сервис на Render
+
+services:
+  - type: web
+    name: tradescreener-pro
+    runtime: python
+    plan: starter  # Можно изменить на free, starter, standard
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: FLASK_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    disk:
+      name: tradescreener-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    healthCheckPath: /api/market-status
+    autoDeploy: true
